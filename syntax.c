@@ -35,17 +35,21 @@ int is_separator(int c)
 }
 
 /* Maps a highlight type to an ANSI color code (foreground colors 30-37) */
+/*
+ * Maps highlight type to a 256-color code.
+ * Used with \x1b[38;5;NNm (foreground) in the rendering loop.
+ */
 int editorSyntaxToColor(int hl)
 {
 	switch (hl) {
-		case HL_NUMBER:     return 31;  /* red */
-		case HL_MATCH:      return 34;  /* blue */
-		case HL_STRING:     return 35;  /* magenta */
+		case HL_NUMBER:     return 208;  /* orange */
+		case HL_MATCH:      return 226;  /* bright yellow (search match) */
+		case HL_STRING:     return 114;  /* green */
 		case HL_COMMENT:
-		case HL_MLCOMMENT:  return 36;  /* cyan */
-		case HL_KEYWORD1:   return 33;  /* yellow */
-		case HL_KEYWORD2:   return 32;  /* green */
-		default:            return 37;  /* white (default) */
+		case HL_MLCOMMENT:  return 243;  /* gray */
+		case HL_KEYWORD1:   return 170;  /* purple */
+		case HL_KEYWORD2:   return 75;   /* blue */
+		default:            return 252;  /* light gray */
 	}
 }
 
