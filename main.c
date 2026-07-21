@@ -99,6 +99,12 @@ struct EditorConfig {
 	char statusmsg[80]; /* message bar text (shown below status bar) */
 	time_t statusmsg_time; /* when message was set — auto-expires after 5 seconds */
 	struct editorSyntax *syntax;  /* current filetype syntax, NULL if none detected */
+	int mouse_x, mouse_y;       /* last mouse click position (screen coordinates) */
+	int sel_active;              /* 1 if text selection is active */
+	int sel_anchor_x;            /* selection start column */
+	int sel_anchor_y;            /* selection start row */
+	char *clipboard;             /* internal clipboard (heap-allocated) */
+	int clipboard_len;           /* length of clipboard content */
 
 	/* Undo/redo stacks — defined below */
 	/* (forward-declared here, actual types defined right after EditorConfig) */
@@ -171,7 +177,13 @@ enum editorKey {
 	HOME_KEY,           /* \x1b[1~ or \x1b[H — jump to start of line */
 	END_KEY,            /* \x1b[4~ or \x1b[F — jump to end of line */
 	PAGE_UP,            /* \x1b[5~ — scroll up one page */
-	PAGE_DOWN           /* \x1b[6~ — scroll down one page */
+	PAGE_DOWN,          /* \x1b[6~ — scroll down one page */
+	MOUSE_CLICK,        /* SGR mouse click event */
+	SHIFT_LEFT,         /* \x1b[1;2D — Shift+Left for selection */
+	SHIFT_RIGHT,        /* \x1b[1;2C — Shift+Right */
+	SHIFT_UP,           /* \x1b[1;2A — Shift+Up */
+	SHIFT_DOWN,         /* \x1b[1;2B — Shift+Down */
+	ALT_BACKSPACE       /* \x1b + DEL(127) — Option+Backspace for word delete */
 };
 
 /* Forward declarations — needed when functions call others defined later in the file */
@@ -179,6 +191,7 @@ void editorSetStatusMessage(const char *fmt, ...);
 void editorRefreshScreen(void);
 int editorReadKey(void);
 void editorUpdateSyntax(erow *row, int row_index);
+int isSelected(int row, int col);
 
 /* --- Undo stack operations --- */
 
@@ -235,6 +248,9 @@ void undoStackClear(UndoStack *s)
 /* Called automatically on exit — restores the terminal to its original state */
 void disableRawMode(void)
 {
+	write(STDOUT_FILENO, "\x1b[?1006l", 8);  /* disable SGR mouse format */
+	write(STDOUT_FILENO, "\x1b[?1000l", 8);  /* disable mouse tracking */
+	write(STDOUT_FILENO, "\x1b[?1049l", 8);  /* switch back to main screen buffer */
 	tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig_termios);
 }
 
@@ -1091,10 +1107,24 @@ void editorRefreshScreen(void)
 			int current_color = -1;  /* track current color to minimize escape sequences */
 			int j;
 
+			int in_sel = 0;  /* track if we're inside a selection highlight */
 			for (j = 0; j < len; j++) {
+				int col_idx = j + E.coloff;  /* actual file column */
+				int sel = isSelected(filerow, col_idx);
+
+				/* Toggle selection inversion on/off */
+				if (sel && !in_sel) {
+					abAppend(&ab, "\x1b[7m", 4);  /* inverted */
+					in_sel = 1;
+					current_color = -1;  /* force color re-emit inside selection */
+				} else if (!sel && in_sel) {
+					abAppend(&ab, "\x1b[m", 3);   /* reset all */
+					in_sel = 0;
+					current_color = -1;  /* force color re-emit after selection */
+				}
+
 				int color = editorSyntaxToColor(hl[j]);
 				if (color != current_color) {
-					/* Color changed — emit escape sequence */
 					current_color = color;
 					char colbuf[16];
 					int clen = snprintf(colbuf, sizeof(colbuf), "\x1b[%dm", color);
@@ -1102,6 +1132,7 @@ void editorRefreshScreen(void)
 				}
 				abAppend(&ab, &c[j], 1);
 			}
+			if (in_sel) abAppend(&ab, "\x1b[m", 3);  /* reset if row ended in selection */
 			abAppend(&ab, "\x1b[39m", 5);  /* reset foreground color */
 		} else {
 			/* Past end of file — draw tilde */
@@ -1184,6 +1215,16 @@ void enableRawMode(void)
 
 	/* Apply the modified settings immediately */
 	tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw);
+
+	/*
+	 * Alternate screen buffer: the terminal has two buffers — main (where
+	 * your shell output lives) and alternate (for fullscreen apps like vim).
+	 * Entering the alternate buffer means our editor output doesn't pollute
+	 * the shell scrollback. When we exit, the main buffer is restored.
+	 */
+	write(STDOUT_FILENO, "\x1b[?1049h", 8);  /* switch to alternate screen buffer */
+	write(STDOUT_FILENO, "\x1b[?1000h", 8);  /* enable mouse tracking (X11 mode) */
+	write(STDOUT_FILENO, "\x1b[?1006h", 8);  /* enable SGR extended mouse format */
 }
 
 /*
@@ -1217,13 +1258,46 @@ int editorReadKey(void)
 		char seq[3];
 
 		if (read(STDIN_FILENO, &seq[0], 1) != 1) return '\x1b';
+
+		/* Alt+Backspace: \x1b followed by DEL (127) — must check BEFORE reading seq[1] */
+		if (seq[0] == '\x7f') return ALT_BACKSPACE;
+
 		if (read(STDIN_FILENO, &seq[1], 1) != 1) return '\x1b';
 
 		if (seq[0] == '[') {
+			/*
+			 * SGR mouse event: \x1b[< button;col;row M  (press) or m (release)
+			 * Example: \x1b[<0;15;3M = left click at col 15, row 3
+			 */
+			if (seq[1] == '<') {
+				char mousebuf[32];
+				int mi = 0;
+				/* Read until 'M' (press) or 'm' (release) */
+				while (mi < (int)sizeof(mousebuf) - 1) {
+					if (read(STDIN_FILENO, &mousebuf[mi], 1) != 1) break;
+					if (mousebuf[mi] == 'M' || mousebuf[mi] == 'm') break;
+					mi++;
+				}
+				mousebuf[mi + 1] = '\0';
+
+				/* Parse button;col;row */
+				int button = 0, col = 0, row = 0;
+				sscanf(mousebuf, "%d;%d;%d", &button, &col, &row);
+
+				/* Only handle left-click press (button 0, ending with 'M') */
+				if (button == 0 && mousebuf[mi] == 'M') {
+					E.mouse_x = col - 1;  /* terminal is 1-based, we're 0-based */
+					E.mouse_y = row - 1;
+					return MOUSE_CLICK;
+				}
+				return '\x1b';  /* ignore other mouse events */
+			}
+
 			if (seq[1] >= '0' && seq[1] <= '9') {
-				/* Extended escape: \x1b [ digit ~ */
 				if (read(STDIN_FILENO, &seq[2], 1) != 1) return '\x1b';
+
 				if (seq[2] == '~') {
+					/* Extended escape: \x1b [ digit ~ */
 					switch (seq[1]) {
 						case '1': return HOME_KEY;
 						case '3': return DEL_KEY;
@@ -1233,6 +1307,27 @@ int editorReadKey(void)
 						case '7': return HOME_KEY;
 						case '8': return END_KEY;
 					}
+				}
+
+				/*
+				 * Shift/Ctrl+Arrow: \x1b[1;2A = Shift+Up, \x1b[1;5C = Ctrl+Right
+				 * seq[1]='1', seq[2]=';', then modifier digit, then direction letter
+				 */
+				if (seq[1] == '1' && seq[2] == ';') {
+					char mod, dir;
+					if (read(STDIN_FILENO, &mod, 1) != 1) return '\x1b';
+					if (read(STDIN_FILENO, &dir, 1) != 1) return '\x1b';
+
+					if (mod == '2') {
+						/* Shift+Arrow — for selection */
+						switch (dir) {
+							case 'A': return SHIFT_UP;
+							case 'B': return SHIFT_DOWN;
+							case 'C': return SHIFT_RIGHT;
+							case 'D': return SHIFT_LEFT;
+						}
+					}
+					/* Other modifiers (Ctrl=5, Alt=3) — ignore for now */
 				}
 			} else {
 				/* Simple escape: \x1b [ letter */
@@ -1325,10 +1420,147 @@ void initEditor(void)
 	E.statusmsg[0] = '\0';
 	E.statusmsg_time = 0;
 	E.syntax = NULL;
+	E.mouse_x = 0;
+	E.mouse_y = 0;
+	E.sel_active = 0;
+	E.sel_anchor_x = 0;
+	E.sel_anchor_y = 0;
+	E.clipboard = NULL;
+	E.clipboard_len = 0;
 	undoStackInit(&undo_stack);
 	undoStackInit(&redo_stack);
 	getWindowSize(&E.screenrows, &E.screencols);
 	E.screenrows -= 2;  /* reserve 2 bottom rows for status bar + message bar */
+}
+
+/* --- Selection --- */
+
+/* Start a selection if one isn't already active */
+void editorStartSelection(void)
+{
+	if (!E.sel_active) {
+		E.sel_anchor_x = E.cx;
+		E.sel_anchor_y = E.cy;
+		E.sel_active = 1;
+	}
+}
+
+/* Clear the active selection */
+void editorClearSelection(void)
+{
+	E.sel_active = 0;
+}
+
+/*
+ * Check if a character at (row, col) is within the active selection.
+ * Selection range is between anchor and cursor (either direction).
+ *
+ * Linearizes positions as (row * large_number + col) to compare.
+ */
+int isSelected(int row, int col)
+{
+	if (!E.sel_active) return 0;
+
+	/* Compute linear positions for anchor and cursor */
+	long anchor = (long)E.sel_anchor_y * 100000 + E.sel_anchor_x;
+	long cursor = (long)E.cy * 100000 + E.cx;
+	long pos = (long)row * 100000 + col;
+
+	long start = anchor < cursor ? anchor : cursor;
+	long end = anchor < cursor ? cursor : anchor;
+
+	return pos >= start && pos < end;
+}
+
+/*
+ * Copy selected text into E.clipboard.
+ * Handles multi-line selections by joining with '\n'.
+ */
+void editorCopySelection(void)
+{
+	if (!E.sel_active) return;
+
+	/* Determine selection bounds (start before end) */
+	int sy, sx, ey, ex;
+	if (E.sel_anchor_y < E.cy ||
+	    (E.sel_anchor_y == E.cy && E.sel_anchor_x <= E.cx)) {
+		sy = E.sel_anchor_y; sx = E.sel_anchor_x;
+		ey = E.cy; ex = E.cx;
+	} else {
+		sy = E.cy; sx = E.cx;
+		ey = E.sel_anchor_y; ex = E.sel_anchor_x;
+	}
+
+	/* Free old clipboard */
+	free(E.clipboard);
+	E.clipboard = NULL;
+	E.clipboard_len = 0;
+
+	/* Build clipboard content */
+	struct AppendBuffer ab = {NULL, 0};
+	int row;
+	for (row = sy; row <= ey && row < E.numrows; row++) {
+		int start_col = (row == sy) ? sx : 0;
+		int end_col = (row == ey) ? ex : E.row[row].size;
+
+		if (start_col > E.row[row].size) start_col = E.row[row].size;
+		if (end_col > E.row[row].size) end_col = E.row[row].size;
+		if (end_col > start_col)
+			abAppend(&ab, &E.row[row].chars[start_col], end_col - start_col);
+
+		if (row < ey)
+			abAppend(&ab, "\n", 1);
+	}
+
+	E.clipboard = ab.data;
+	E.clipboard_len = ab.len;
+}
+
+/* Paste clipboard content at cursor position */
+void editorPasteClipboard(void)
+{
+	if (!E.clipboard || E.clipboard_len == 0) {
+		editorSetStatusMessage("Clipboard empty");
+		return;
+	}
+
+	int i;
+	for (i = 0; i < E.clipboard_len; i++) {
+		if (E.clipboard[i] == '\n') {
+			editorInsertNewline();
+		} else {
+			editorInsertChar(E.clipboard[i]);
+		}
+	}
+}
+
+/* --- Word Delete --- */
+
+/*
+ * Delete backward one word (Option+Backspace / Alt+Backspace).
+ * Deletes whitespace first, then deletes until the next word boundary.
+ * Each char deletion goes through editorDeleteChar for undo support.
+ */
+void editorDeleteWord(void)
+{
+	if (E.cy >= E.numrows) return;
+	if (E.cx == 0 && E.cy == 0) return;
+
+	erow *row = &E.row[E.cy];
+
+	/* If at column 0, just join with previous line (like normal backspace) */
+	if (E.cx == 0) {
+		editorDeleteChar();
+		return;
+	}
+
+	/* Skip whitespace backward */
+	while (E.cx > 0 && row->chars[E.cx - 1] == ' ')
+		editorDeleteChar();
+
+	/* Skip non-separator characters backward (the word itself) */
+	while (E.cx > 0 && row->chars[E.cx - 1] != ' ')
+		editorDeleteChar();
 }
 
 /* --- Undo/Redo --- */
@@ -1529,9 +1761,7 @@ void editorProcessKeypress(void)
 				quit_times--;
 				return;  /* return early — don't reset quit_times below */
 			}
-			write(STDOUT_FILENO, "\x1b[2J", 4);   /* clear screen */
-			write(STDOUT_FILENO, "\x1b[H", 3);    /* cursor home */
-			exit(0);
+			exit(0);  /* disableRawMode via atexit restores main screen buffer */
 			break;
 
 		case CTRL_KEY('s'):                 /* Save */
@@ -1550,8 +1780,52 @@ void editorProcessKeypress(void)
 			editorFind();
 			break;
 
+		case CTRL_KEY('c'):                 /* Copy selection */
+			if (E.sel_active) {
+				editorCopySelection();
+				editorClearSelection();
+				editorSetStatusMessage("Copied to clipboard");
+			}
+			break;
+
+		case CTRL_KEY('v'):                 /* Paste clipboard */
+			editorClearSelection();
+			editorPasteClipboard();
+			break;
+
 		case CTRL_KEY('d'):                 /* Duplicate line */
+			editorClearSelection();
 			editorDuplicateLine();
+			break;
+
+		case MOUSE_CLICK:                   /* Mouse click — position cursor */
+			editorClearSelection();
+			E.cy = E.mouse_y + E.rowoff;
+			E.cx = E.mouse_x + E.coloff;
+			/* Clamp to file bounds */
+			if (E.cy >= E.numrows)
+				E.cy = E.numrows ? E.numrows - 1 : 0;
+			if (E.cy < E.numrows && E.cx > E.row[E.cy].size)
+				E.cx = E.row[E.cy].size;
+			break;
+
+		case SHIFT_UP:                      /* Shift+Arrow — extend selection */
+		case SHIFT_DOWN:
+		case SHIFT_LEFT:
+		case SHIFT_RIGHT:
+			editorStartSelection();
+			/* Map shift keys to regular arrow movement */
+			switch (c) {
+				case SHIFT_UP:    editorMoveCursor(ARROW_UP); break;
+				case SHIFT_DOWN:  editorMoveCursor(ARROW_DOWN); break;
+				case SHIFT_LEFT:  editorMoveCursor(ARROW_LEFT); break;
+				case SHIFT_RIGHT: editorMoveCursor(ARROW_RIGHT); break;
+			}
+			break;
+
+		case ALT_BACKSPACE:                 /* Option+Backspace — delete word */
+			editorClearSelection();
+			editorDeleteWord();
 			break;
 
 		case BACKSPACE:                     /* Backspace key (127) */
@@ -1585,6 +1859,7 @@ void editorProcessKeypress(void)
 		case ARROW_DOWN:
 		case ARROW_LEFT:
 		case ARROW_RIGHT:
+			editorClearSelection();
 			editorMoveCursor(c);
 			break;
 
