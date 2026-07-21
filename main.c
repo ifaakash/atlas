@@ -4,6 +4,8 @@
 #include <stdlib.h>    /* atexit() */
 #include <unistd.h>    /* read(), STDIN_FILENO */
 #include <termios.h>   /* struct termios, tcgetattr, tcsetattr */
+#include <string.h>    /* memcpy */
+#include <sys/ioctl.h> /* ioctl, TIOCGWINSZ, struct winsize */
 
 /* Global: we need the original settings accessible from the atexit callback */
 struct termios orig_termios;
@@ -12,6 +14,71 @@ struct termios orig_termios;
 void disableRawMode(void)
 {
 	tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig_termios);
+}
+
+struct AppendBuffer {
+    char *data;    // pointer to the heap-allocated memory
+    int len;       // how many bytes are currently in the buffer
+};
+
+void abAppend(struct AppendBuffer *ab, const char *s, int len){
+    // new data is appended to the ab variable, and then realloc is used to re-evalute the new size of variable
+    ab->data = realloc(ab->data, ab->len + len);
+    memcpy(ab->data + ab->len, s, len);
+    ab->len += len;
+}
+
+/*
+ * Gets the terminal dimensions (rows and columns).
+ * Returns 0 on success, -1 on failure.
+ *
+ * Uses ioctl() — a system call for device-specific operations.
+ * TIOCGWINSZ = "Terminal I/O Control Get WINdow SiZe"
+ * It fills a struct winsize with .ws_row and .ws_col.
+ *
+ * We take pointers to rows/cols so the caller provides storage.
+ * This is a common C pattern — functions "return" multiple values
+ * by writing through pointers the caller passes in.
+ */
+int getWindowSize(int *rows, int *cols)
+{
+	struct winsize ws;
+
+	/* ioctl returns -1 on failure, or ws_col/ws_row could be 0 (invalid) */
+	if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == -1 || ws.ws_col == 0) {
+		return -1;
+	}
+
+	*cols = ws.ws_col;
+	*rows = ws.ws_row;
+	return 0;
+}
+
+void editorRefreshScreen(){
+	/*
+	- \x1b[2J — clear entire screen
+	- \x1b[H — move cursor to top-left (row 1, col 1)
+	- \x1b[?25l / \x1b[?25h — hide/show cursor
+	- \x1b[{row};{col}H — move cursor to specific position
+
+	In this function, I need to add/append these calls to abAppend() function
+	*/
+
+	// once this is done, i need to clear the buffer as well, like call the abFree function
+
+	struct AppendBuffer ab = {NULL, 0};
+	abAppend(&ab, "\x1b[2J", 4);
+	abAppend(&ab, "\x1b[H", 3);
+	abFree(&ab);
+
+}
+
+void abFree(struct AppendBuffer *ab){
+	// this function just set len=0 or clear the data variable
+	free(ab->data);
+	ab->data = NULL;
+	ab->len = 0;
+
 }
 
 /* Switches terminal to raw mode */
