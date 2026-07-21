@@ -5,7 +5,7 @@
 CC = gcc
 
 # Compiler flags 
-CFLAGS= -std11 -Wall -Wextra -g
+CFLAGS= -std=c11 -Wall -Wextra -g
 
 
 # Compile main.c
