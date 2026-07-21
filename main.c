@@ -39,6 +39,9 @@ struct EditorConfig {
 
 struct EditorConfig E;
 
+/* Forward declarations — needed when functions call others defined later in the file */
+void editorSetStatusMessage(const char *fmt, ...);
+
 /* Called automatically on exit — restores the terminal to its original state */
 void disableRawMode(void)
 {
@@ -91,26 +94,170 @@ void abFree(struct AppendBuffer *ab){
 
 }
 
-/*
- * Appends a new row to E.row array.
- * - realloc grows the array by one erow
- * - malloc allocates space for the line's characters
- * - memcpy copies the line content into that space
- *
- * This is the same grow-and-copy pattern as abAppend,
- * but for an array of structs instead of raw bytes.
- */
-void editorAppendRow(char *s, int len)
+/* --- Row operations --- */
+
+/* Free memory owned by a row */
+void editorFreeRow(erow *row)
 {
-	/* Grow the row array by one */
+	free(row->chars);
+}
+
+/*
+ * Insert a new row at position 'at' in the E.row array.
+ * Shifts existing rows down using memmove.
+ *
+ * memmove is like memcpy but safe for overlapping memory regions.
+ * When we shift rows down, source and destination overlap — so memmove is required.
+ */
+void editorInsertRow(int at, char *s, int len)
+{
+	if (at < 0 || at > E.numrows) return;
+
+	/* Grow the array by one row */
 	E.row = realloc(E.row, sizeof(erow) * (E.numrows + 1));
 
-	int at = E.numrows;
+	/* Shift rows after 'at' down by one to make room */
+	memmove(&E.row[at + 1], &E.row[at], sizeof(erow) * (E.numrows - at));
+
+	/* Fill in the new row */
 	E.row[at].size = len;
-	E.row[at].chars = malloc(len);
+	E.row[at].chars = malloc(len + 1);  /* +1 for null terminator (needed by strstr in search) */
 	memcpy(E.row[at].chars, s, len);
+	E.row[at].chars[len] = '\0';
 
 	E.numrows++;
+	E.dirty++;
+}
+
+/* Convenience wrapper — appends a row at the end (used during file loading) */
+void editorAppendRow(char *s, int len)
+{
+	editorInsertRow(E.numrows, s, len);
+	E.dirty = 0;  /* loading a file shouldn't count as dirty — reset after each append */
+}
+
+/* Delete row at index 'at' from E.row array */
+void editorDeleteRow(int at)
+{
+	if (at < 0 || at >= E.numrows) return;
+	editorFreeRow(&E.row[at]);
+
+	/* Shift rows above 'at' up to fill the gap */
+	memmove(&E.row[at], &E.row[at + 1], sizeof(erow) * (E.numrows - at - 1));
+	E.numrows--;
+	E.dirty++;
+}
+
+/*
+ * Insert character 'c' at position 'at' in a row.
+ * Uses memmove to shift existing characters right by one.
+ */
+void editorRowInsertChar(erow *row, int at, int c)
+{
+	if (at < 0 || at > row->size) at = row->size;
+
+	/* +2: one for new char, one for null terminator */
+	row->chars = realloc(row->chars, row->size + 2);
+
+	/* Shift characters from 'at' onwards one position right */
+	memmove(&row->chars[at + 1], &row->chars[at], row->size - at + 1);
+
+	row->size++;
+	row->chars[at] = c;
+	E.dirty++;
+}
+
+/* Delete character at position 'at' in a row */
+void editorRowDeleteChar(erow *row, int at)
+{
+	if (at < 0 || at >= row->size) return;
+
+	/* Shift characters left to close the gap — overwrites chars[at] */
+	memmove(&row->chars[at], &row->chars[at + 1], row->size - at);
+
+	row->size--;
+	E.dirty++;
+}
+
+/* Append string 's' (length 'len') to end of a row */
+void editorRowAppendString(erow *row, char *s, int len)
+{
+	row->chars = realloc(row->chars, row->size + len + 1);
+	memcpy(&row->chars[row->size], s, len);
+	row->size += len;
+	row->chars[row->size] = '\0';
+	E.dirty++;
+}
+
+/* --- Editor-level operations (work on cursor position) --- */
+
+/* Insert a character at the current cursor position */
+void editorInsertChar(int c)
+{
+	/* If cursor is at the very end of the file, add a new empty row first */
+	if (E.cy == E.numrows)
+		editorInsertRow(E.numrows, "", 0);
+
+	editorRowInsertChar(&E.row[E.cy], E.cx, c);
+	E.cx++;
+}
+
+/*
+ * Handle Backspace: delete the character before the cursor.
+ * If at the start of a line, join with the previous line.
+ */
+void editorDeleteChar(void)
+{
+	if (E.cy == E.numrows) return;          /* past end of file */
+	if (E.cx == 0 && E.cy == 0) return;    /* top-left corner, nothing to delete */
+
+	erow *row = &E.row[E.cy];
+	if (E.cx > 0) {
+		/* Normal case: delete character to the left */
+		editorRowDeleteChar(row, E.cx - 1);
+		E.cx--;
+	} else {
+		/* At column 0: join this line with the previous line */
+		E.cx = E.row[E.cy - 1].size;  /* cursor goes to end of previous line */
+		editorRowAppendString(&E.row[E.cy - 1], row->chars, row->size);
+		editorDeleteRow(E.cy);
+		E.cy--;
+	}
+}
+
+/* Insert a newline — splits the current row at the cursor position */
+void editorInsertNewline(void)
+{
+	if (E.cx == 0) {
+		/* Cursor at start of line: insert a blank line above */
+		editorInsertRow(E.cy, "", 0);
+	} else {
+		/* Split: text after cursor goes to new line below */
+		erow *row = &E.row[E.cy];
+		editorInsertRow(E.cy + 1, &row->chars[E.cx], row->size - E.cx);
+
+		/* Truncate current row at cursor position */
+		row = &E.row[E.cy];  /* re-read — realloc in editorInsertRow may have moved it */
+		row->size = E.cx;
+		row->chars[row->size] = '\0';
+	}
+
+	E.cy++;
+	E.cx = 0;
+}
+
+/*
+ * Duplicate the current line (Ctrl+D).
+ * Inserts a copy of the current row directly below, then moves cursor down.
+ */
+void editorDuplicateLine(void)
+{
+	if (E.cy >= E.numrows) return;  /* nothing to duplicate */
+
+	erow *row = &E.row[E.cy];
+	editorInsertRow(E.cy + 1, row->chars, row->size);
+	E.cy++;  /* move to the duplicated line */
+	editorSetStatusMessage("Line duplicated");
 }
 
 /*
@@ -148,6 +295,7 @@ void editorOpen(char *filename)
 
 	free(line);
 	fclose(fp);
+	E.dirty = 0;  /* just loaded — not modified yet */
 }
 
 /*
@@ -372,10 +520,16 @@ void enableRawMode(void)
  * either a regular character OR a special key.
  */
 enum editorKey {
+	BACKSPACE = 127,    /* ASCII DEL — what Backspace sends in raw mode */
 	ARROW_LEFT = 1000,
-	ARROW_RIGHT,    /* 1001 — enum auto-increments */
-	ARROW_UP,       /* 1002 */
-	ARROW_DOWN      /* 1003 */
+	ARROW_RIGHT,
+	ARROW_UP,
+	ARROW_DOWN,
+	DEL_KEY,            /* \x1b[3~ — the Delete key */
+	HOME_KEY,           /* \x1b[1~ or \x1b[H — jump to start of line */
+	END_KEY,            /* \x1b[4~ or \x1b[F — jump to end of line */
+	PAGE_UP,            /* \x1b[5~ — scroll up one page */
+	PAGE_DOWN           /* \x1b[6~ — scroll down one page */
 };
 
 /*
@@ -386,6 +540,15 @@ enum editorKey {
  * Arrow keys send 3 bytes: \x1b [ A/B/C/D
  * We detect the \x1b, then read the next two bytes to identify which arrow.
  */
+/*
+ * Reads a single keypress and returns it.
+ * Regular keys return their ASCII value.
+ * Special keys (arrows, Home, End, etc.) return enum editorKey values.
+ *
+ * Escape sequences come in different formats:
+ *   \x1b [ letter      — arrow keys: A/B/C/D, also H (Home), F (End)
+ *   \x1b [ digit ~     — Delete(3), Home(1/7), End(4/8), PageUp(5), PageDown(6)
+ */
 int editorReadKey(void)
 {
 	char c;
@@ -395,23 +558,44 @@ int editorReadKey(void)
 	while ((nread = read(STDIN_FILENO, &c, 1)) == 0)
 		;
 
-	/* If it's an escape character, it might be an arrow key sequence */
+	/* If it's an escape character, it might be a multi-byte sequence */
 	if (c == '\x1b') {
-		char seq[2];
+		char seq[3];
 
-		/*
-		 * Try to read the next two bytes. If they don't arrive
-		 * (timeout), the user just pressed Escape by itself.
-		 */
 		if (read(STDIN_FILENO, &seq[0], 1) != 1) return '\x1b';
 		if (read(STDIN_FILENO, &seq[1], 1) != 1) return '\x1b';
 
 		if (seq[0] == '[') {
+			if (seq[1] >= '0' && seq[1] <= '9') {
+				/* Extended escape: \x1b [ digit ~ */
+				if (read(STDIN_FILENO, &seq[2], 1) != 1) return '\x1b';
+				if (seq[2] == '~') {
+					switch (seq[1]) {
+						case '1': return HOME_KEY;
+						case '3': return DEL_KEY;
+						case '4': return END_KEY;
+						case '5': return PAGE_UP;
+						case '6': return PAGE_DOWN;
+						case '7': return HOME_KEY;
+						case '8': return END_KEY;
+					}
+				}
+			} else {
+				/* Simple escape: \x1b [ letter */
+				switch (seq[1]) {
+					case 'A': return ARROW_UP;
+					case 'B': return ARROW_DOWN;
+					case 'C': return ARROW_RIGHT;
+					case 'D': return ARROW_LEFT;
+					case 'H': return HOME_KEY;
+					case 'F': return END_KEY;
+				}
+			}
+		} else if (seq[0] == 'O') {
+			/* Some terminals send \x1b O H / \x1b O F for Home/End */
 			switch (seq[1]) {
-				case 'A': return ARROW_UP;
-				case 'B': return ARROW_DOWN;
-				case 'C': return ARROW_RIGHT;
-				case 'D': return ARROW_LEFT;
+				case 'H': return HOME_KEY;
+				case 'F': return END_KEY;
 			}
 		}
 
@@ -490,6 +674,73 @@ void initEditor(void)
 	E.screenrows -= 2;  /* reserve 2 bottom rows for status bar + message bar */
 }
 
+/*
+ * Central key handling — maps every keypress to an action.
+ * This is the "controller" in the editor's main loop.
+ */
+void editorProcessKeypress(void)
+{
+	int c = editorReadKey();
+
+	switch (c) {
+		case '\r':                          /* Enter key */
+			editorInsertNewline();
+			break;
+
+		case CTRL_KEY('q'):                 /* Quit */
+			write(STDOUT_FILENO, "\x1b[2J", 4);   /* clear screen */
+			write(STDOUT_FILENO, "\x1b[H", 3);    /* cursor home */
+			exit(0);
+			break;
+
+		case CTRL_KEY('d'):                 /* Duplicate line */
+			editorDuplicateLine();
+			break;
+
+		case BACKSPACE:                     /* Backspace key (127) */
+		case CTRL_KEY('h'):                 /* Ctrl+H — historical backspace */
+		case DEL_KEY:                       /* Delete key */
+			if (c == DEL_KEY)
+				editorMoveCursor(ARROW_RIGHT);  /* delete = backspace one position right */
+			editorDeleteChar();
+			break;
+
+		case HOME_KEY:
+			E.cx = 0;
+			break;
+
+		case END_KEY:
+			if (E.cy < E.numrows)
+				E.cx = E.row[E.cy].size;
+			break;
+
+		case PAGE_UP:
+		case PAGE_DOWN:
+			{
+				/* Move cursor a full page up or down */
+				int times = E.screenrows;
+				while (times--)
+					editorMoveCursor(c == PAGE_UP ? ARROW_UP : ARROW_DOWN);
+			}
+			break;
+
+		case ARROW_UP:
+		case ARROW_DOWN:
+		case ARROW_LEFT:
+		case ARROW_RIGHT:
+			editorMoveCursor(c);
+			break;
+
+		case CTRL_KEY('l'):                 /* Refresh — no-op, redraws anyway */
+		case '\x1b':                        /* Escape — ignore */
+			break;
+
+		default:
+			editorInsertChar(c);            /* Normal character — insert it */
+			break;
+	}
+}
+
 int main(int argc, char *argv[])
 {
 	enableRawMode();
@@ -500,18 +751,11 @@ int main(int argc, char *argv[])
 		editorOpen(argv[1]);
 	}
 
-	editorSetStatusMessage("HELP: Ctrl-Q = quit");
+	editorSetStatusMessage("HELP: Ctrl-S = save | Ctrl-Q = quit | Ctrl-F = find | Ctrl-D = dup line");
 
 	while (1) {
 		editorRefreshScreen();
-
-		int key = editorReadKey();
-
-		/* Quit on Ctrl+Q */
-		if (key == CTRL_KEY('q'))
-			break;
-
-		editorMoveCursor(key);
+		editorProcessKeypress();
 	}
 
 	return 0;
