@@ -183,7 +183,9 @@ enum editorKey {
 	SHIFT_RIGHT,        /* \x1b[1;2C — Shift+Right */
 	SHIFT_UP,           /* \x1b[1;2A — Shift+Up */
 	SHIFT_DOWN,         /* \x1b[1;2B — Shift+Down */
-	ALT_BACKSPACE       /* \x1b + DEL(127) — Option+Backspace for word delete */
+	ALT_BACKSPACE,      /* \x1b + DEL(127) — Option+Backspace for word delete */
+	MOUSE_SCROLL_UP,    /* mouse wheel up (SGR button 64) */
+	MOUSE_SCROLL_DOWN   /* mouse wheel down (SGR button 65) */
 };
 
 /* Forward declarations — needed when functions call others defined later in the file */
@@ -1284,12 +1286,15 @@ int editorReadKey(void)
 				int button = 0, col = 0, row = 0;
 				sscanf(mousebuf, "%d;%d;%d", &button, &col, &row);
 
-				/* Only handle left-click press (button 0, ending with 'M') */
+				/* Left-click press (button 0, ending with 'M') */
 				if (button == 0 && mousebuf[mi] == 'M') {
 					E.mouse_x = col - 1;  /* terminal is 1-based, we're 0-based */
 					E.mouse_y = row - 1;
 					return MOUSE_CLICK;
 				}
+				/* Mouse scroll: button 64 = scroll up, 65 = scroll down */
+				if (button == 64) return MOUSE_SCROLL_UP;
+				if (button == 65) return MOUSE_SCROLL_DOWN;
 				return '\x1b';  /* ignore other mouse events */
 			}
 
@@ -1824,8 +1829,41 @@ void editorProcessKeypress(void)
 			break;
 
 		case ALT_BACKSPACE:                 /* Option+Backspace — delete word */
+		case CTRL_KEY('w'):                 /* Ctrl+W — also delete word (universal) */
 			editorClearSelection();
 			editorDeleteWord();
+			break;
+
+		case MOUSE_SCROLL_UP:              /* Mouse wheel up — scroll 3 lines */
+			{
+				int i;
+				for (i = 0; i < 3; i++) editorMoveCursor(ARROW_UP);
+			}
+			break;
+
+		case MOUSE_SCROLL_DOWN:            /* Mouse wheel down — scroll 3 lines */
+			{
+				int i;
+				for (i = 0; i < 3; i++) editorMoveCursor(ARROW_DOWN);
+			}
+			break;
+
+		case CTRL_KEY('g'):                /* Go to line number */
+			{
+				char *input = editorPrompt("Go to line: %s", NULL);
+				if (input) {
+					int line = atoi(input);
+					free(input);
+					if (line > 0 && line <= E.numrows) {
+						E.cy = line - 1;  /* user types 1-based, we're 0-based */
+						E.cx = 0;
+						E.rowoff = E.cy;  /* scroll so target line is at top */
+						editorSetStatusMessage("Jumped to line %d", line);
+					} else {
+						editorSetStatusMessage("Invalid line number");
+					}
+				}
+			}
 			break;
 
 		case BACKSPACE:                     /* Backspace key (127) */
