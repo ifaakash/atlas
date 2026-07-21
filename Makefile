@@ -1,16 +1,19 @@
-# Use of phony - This target is not a real file. Always run its commands when requested
-.PHONY: main clean
+# Atlas text editor — modular build
+.PHONY: all clean
 
-# Compiler
 CC = gcc
+CFLAGS = -std=c11 -Wall -Wextra -g
 
-# Compiler flags 
-CFLAGS= -std=c11 -Wall -Wextra -g
+SRCS = main.c terminal.c buffer.c display.c editor.c file.c search.c syntax.c select.c
+OBJS = $(SRCS:.c=.o)
 
+all: atlas
 
-# Compile main.c
-main:
-	$(CC) $(CFLAGS) main.c -o atlas
+atlas: $(OBJS)
+	$(CC) $(CFLAGS) -o atlas $(OBJS)
+
+%.o: %.c atlas.h
+	$(CC) $(CFLAGS) -c $< -o $@
 
 clean:
-	rm -rf *.o atlas *.dSYM
+	rm -f atlas $(OBJS) *.dSYM
