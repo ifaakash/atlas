@@ -13,4 +13,4 @@ main:
 	$(CC) $(CFLAGS) main.c -o atlas
 
 clean:
-	rm -f *.o atlas
+	rm -rf *.o atlas *.dSYM
