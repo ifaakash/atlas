@@ -54,31 +54,52 @@ int getWindowSize(int *rows, int *cols)
 	return 0;
 }
 
-void editorRefreshScreen(){
-	/*
-	- \x1b[2J — clear entire screen
-	- \x1b[H — move cursor to top-left (row 1, col 1)
-	- \x1b[?25l / \x1b[?25h — hide/show cursor
-	- \x1b[{row};{col}H — move cursor to specific position
-
-	In this function, I need to add/append these calls to abAppend() function
-	*/
-
-	// once this is done, i need to clear the buffer as well, like call the abFree function
-
-	struct AppendBuffer ab = {NULL, 0};
-	abAppend(&ab, "\x1b[2J", 4);
-	abAppend(&ab, "\x1b[H", 3);
-	abFree(&ab);
-
-}
-
 void abFree(struct AppendBuffer *ab){
 	// this function just set len=0 or clear the data variable
 	free(ab->data);
 	ab->data = NULL;
 	ab->len = 0;
 
+}
+
+void editorRefreshScreen(void)
+{
+	int rows, cols;
+	getWindowSize(&rows, &cols);
+
+	struct AppendBuffer ab = {NULL, 0};
+
+	/* 1. Hide cursor — prevents flickering during redraw */
+	abAppend(&ab, "\x1b[?25l", 6);
+
+	/* 2. Move cursor to top-left — we redraw from here */
+	abAppend(&ab, "\x1b[H", 3);
+
+	/* 3. Draw tildes on every row, like vim's empty-file display */
+	int y;
+	for (y = 0; y < rows; y++) {
+		abAppend(&ab, "~", 1);
+
+		/* Clear the rest of this line (erases leftover chars from previous frame) */
+		abAppend(&ab, "\x1b[K", 3);
+
+		/* Don't add newline on the very last row — avoids scrolling the screen */
+		if (y < rows - 1) {
+			abAppend(&ab, "\r\n", 2);
+		}
+	}
+
+	/* 4. Move cursor back to top-left */
+	abAppend(&ab, "\x1b[H", 3);
+
+	/* 5. Show cursor again */
+	abAppend(&ab, "\x1b[?25h", 6);
+
+	/* 6. Single write — everything hits the terminal at once, no flicker */
+	write(STDOUT_FILENO, ab.data, ab.len);
+
+	/* 7. Free the buffer */
+	abFree(&ab);
 }
 
 /* Switches terminal to raw mode */
@@ -127,34 +148,27 @@ void enableRawMode(void)
 	tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw);
 }
 
+/* Ctrl key strips bits 5-7, leaving only bits 0-4. So Ctrl+Q = 'q' & 0x1f = 17 */
+#define CTRL_KEY(k) ((k) & 0x1f)
+
 int main(void)
 {
 	enableRawMode();
 
-	/* Read keypresses and print their ASCII values */
-	char c;
 	while (1) {
+		/* Refresh screen every loop iteration */
+		editorRefreshScreen();
+
+		/* Read a keypress */
+		char c;
 		int nread = read(STDIN_FILENO, &c, 1);
 
-		/* read() returns 0 on timeout (VMIN=0, VTIME=1), just loop again */
 		if (nread == 0)
 			continue;
 
-		/* Quit on 'q' */
-		if (c == 'q')
+		/* Quit on Ctrl+Q */
+		if (c == CTRL_KEY('q'))
 			break;
-
-		/*
-		 * Since OPOST is off, '\n' won't move cursor to start of line.
-		 * We must print '\r\n' explicitly for proper newlines.
-		 */
-		if (c >= 32 && c < 127) {
-			/* Printable character — show the char and its ASCII value */
-			printf("'%c' (%d)\r\n", c, c);
-		} else {
-			/* Control character — just show the value */
-			printf("(%d)\r\n", c);
-		}
 	}
 
 	return 0;
