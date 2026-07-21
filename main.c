@@ -10,11 +10,23 @@
 /* Global: we need the original settings accessible from the atexit callback */
 struct termios orig_termios;
 
+/*
+ * One row of text in the file.
+ * chars: heap-allocated string (NOT null-terminated — we track length)
+ * size:  number of bytes in chars
+ */
+typedef struct {
+	int size;
+	char *chars;
+} erow;
+
 /* All editor state lives here — one struct, easy to find, easy to refactor later */
 struct EditorConfig {
 	int cx, cy;         /* cursor position (column, row) */
 	int screenrows;     /* terminal height */
 	int screencols;     /* terminal width */
+	int numrows;        /* how many rows of text are loaded */
+	erow *row;          /* dynamic array of rows — grown with realloc */
 };
 
 struct EditorConfig E;
@@ -71,6 +83,62 @@ void abFree(struct AppendBuffer *ab){
 
 }
 
+/*
+ * Appends a new row to E.row array.
+ * - realloc grows the array by one erow
+ * - malloc allocates space for the line's characters
+ * - memcpy copies the line content into that space
+ *
+ * This is the same grow-and-copy pattern as abAppend,
+ * but for an array of structs instead of raw bytes.
+ */
+void editorAppendRow(char *s, int len)
+{
+	/* Grow the row array by one */
+	E.row = realloc(E.row, sizeof(erow) * (E.numrows + 1));
+
+	int at = E.numrows;
+	E.row[at].size = len;
+	E.row[at].chars = malloc(len);
+	memcpy(E.row[at].chars, s, len);
+
+	E.numrows++;
+}
+
+/*
+ * Opens a file and loads it line by line into E.row.
+ *
+ * Uses fopen/getline from <stdio.h>.
+ * getline() reads one line at a time, allocating memory as needed.
+ * We strip trailing \n and \r before storing — our renderer adds \r\n itself.
+ */
+void editorOpen(char *filename)
+{
+	FILE *fp = fopen(filename, "r");
+	if (!fp) return;
+
+	char *line = NULL;
+	size_t linecap = 0;  /* getline uses this to track allocated size */
+	ssize_t linelen;
+
+	/*
+	 * getline() returns the number of chars read, or -1 at EOF.
+	 * It allocates/reallocates `line` as needed — we must free it after.
+	 * linecap tells getline how big the current buffer is.
+	 */
+	while ((linelen = getline(&line, &linecap, fp)) != -1) {
+		/* Strip trailing newline/carriage return */
+		while (linelen > 0 && (line[linelen - 1] == '\n' ||
+		                       line[linelen - 1] == '\r'))
+			linelen--;
+
+		editorAppendRow(line, linelen);
+	}
+
+	free(line);
+	fclose(fp);
+}
+
 void editorRefreshScreen(void)
 {
 	struct AppendBuffer ab = {NULL, 0};
@@ -81,15 +149,24 @@ void editorRefreshScreen(void)
 	/* 2. Move cursor to top-left — we redraw from here */
 	abAppend(&ab, "\x1b[H", 3);
 
-	/* 3. Draw tildes on every row, like vim's empty-file display */
+	/* 3. Draw each row — file content if available, tilde if past end of file */
 	int y;
 	for (y = 0; y < E.screenrows; y++) {
-		abAppend(&ab, "~", 1);
+		if (y < E.numrows) {
+			/* This row has file content — draw it */
+			int len = E.row[y].size;
+			/* Truncate if the line is longer than the screen */
+			if (len > E.screencols)
+				len = E.screencols;
+			abAppend(&ab, E.row[y].chars, len);
+		} else {
+			/* Past end of file — draw tilde */
+			abAppend(&ab, "~", 1);
+		}
 
-		/* Clear the rest of this line (erases leftover chars from previous frame) */
+		/* Clear the rest of this line */
 		abAppend(&ab, "\x1b[K", 3);
 
-		/* Don't add newline on the very last row — avoids scrolling the screen */
 		if (y < E.screenrows - 1) {
 			abAppend(&ab, "\r\n", 2);
 		}
@@ -249,13 +326,20 @@ void initEditor(void)
 {
 	E.cx = 0;
 	E.cy = 0;
+	E.numrows = 0;
+	E.row = NULL;
 	getWindowSize(&E.screenrows, &E.screencols);
 }
 
-int main(void)
+int main(int argc, char *argv[])
 {
 	enableRawMode();
 	initEditor();
+
+	/* If a filename was passed on the command line, open it */
+	if (argc >= 2) {
+		editorOpen(argv[1]);
+	}
 
 	while (1) {
 		editorRefreshScreen();
