@@ -105,6 +105,7 @@ struct EditorConfig {
 	int sel_anchor_y;            /* selection start row */
 	char *clipboard;             /* internal clipboard (heap-allocated) */
 	int clipboard_len;           /* length of clipboard content */
+	int line_number_width;       /* width of line number gutter (digits + 1 space) */
 
 	/* Undo/redo stacks — defined below */
 	/* (forward-declared here, actual types defined right after EditorConfig) */
@@ -194,6 +195,7 @@ void editorRefreshScreen(void);
 int editorReadKey(void);
 void editorUpdateSyntax(erow *row, int row_index);
 int isSelected(int row, int col);
+void editorUpdateLineNumberWidth(void);
 
 /* --- Undo stack operations --- */
 
@@ -694,7 +696,25 @@ void editorInsertNewline(void)
 	}
 
 	E.cy++;
-	E.cx = 0;
+
+	/*
+	 * Auto-indent: copy leading whitespace from the previous line.
+	 * Scans the line we just left for spaces/tabs at the beginning,
+	 * then inserts them into the new line.
+	 */
+	erow *prev = &E.row[E.cy - 1];
+	int indent = 0;
+	while (indent < prev->size && (prev->chars[indent] == ' ' || prev->chars[indent] == '\t'))
+		indent++;
+
+	if (indent > 0) {
+		int i;
+		for (i = 0; i < indent; i++)
+			editorRowInsertChar(&E.row[E.cy], i, prev->chars[i]);
+		E.cx = indent;
+	} else {
+		E.cx = 0;
+	}
 }
 
 /*
@@ -1093,16 +1113,28 @@ void editorRefreshScreen(void)
 	/* 2. Move cursor to top-left — we redraw from here */
 	abAppend(&ab, "\x1b[H", 3);
 
-	/* 3. Draw each row — file content if available, tilde if past end of file */
+	/* Update line number gutter width based on file size */
+	editorUpdateLineNumberWidth();
+	int content_cols = E.screencols - E.line_number_width;  /* columns available for text */
+
+	/* 3. Draw each row — line number + file content or tilde */
 	int y;
 	for (y = 0; y < E.screenrows; y++) {
 		int filerow = y + E.rowoff;  /* map screen row to file row */
 
 		if (filerow < E.numrows) {
-			/* This row has file content — draw it with syntax colors */
+			/* Draw line number in dim color */
+			char linenum[16];
+			int lnlen = snprintf(linenum, sizeof(linenum), "%*d ",
+			                     E.line_number_width - 1, filerow + 1);
+			abAppend(&ab, "\x1b[90m", 5);  /* dim/gray color */
+			abAppend(&ab, linenum, lnlen);
+			abAppend(&ab, "\x1b[39m", 5);  /* reset color */
+
+			/* Draw file content with syntax colors */
 			int len = E.row[filerow].size - E.coloff;
 			if (len < 0) len = 0;
-			if (len > E.screencols) len = E.screencols;
+			if (len > content_cols) len = content_cols;
 
 			char *c = &E.row[filerow].chars[E.coloff];
 			unsigned char *hl = &E.row[filerow].hl[E.coloff];
@@ -1137,7 +1169,11 @@ void editorRefreshScreen(void)
 			if (in_sel) abAppend(&ab, "\x1b[m", 3);  /* reset if row ended in selection */
 			abAppend(&ab, "\x1b[39m", 5);  /* reset foreground color */
 		} else {
-			/* Past end of file — draw tilde */
+			/* Past end of file — draw tilde with gutter padding */
+			char padding[16];
+			int padlen = snprintf(padding, sizeof(padding), "%*s",
+			                     E.line_number_width, "");
+			abAppend(&ab, padding, padlen);
 			abAppend(&ab, "~", 1);
 		}
 
@@ -1160,7 +1196,7 @@ void editorRefreshScreen(void)
 	char buf[32];
 	snprintf(buf, sizeof(buf), "\x1b[%d;%dH",
 	         (E.cy - E.rowoff) + 1,
-	         (E.cx - E.coloff) + 1);
+	         (E.cx - E.coloff) + E.line_number_width + 1);  /* offset by gutter */
 	abAppend(&ab, buf, strlen(buf));
 
 	/* 5. Show cursor again */
@@ -1432,6 +1468,7 @@ void initEditor(void)
 	E.sel_anchor_y = 0;
 	E.clipboard = NULL;
 	E.clipboard_len = 0;
+	E.line_number_width = 4;  /* default: 3 digits + 1 space */
 	undoStackInit(&undo_stack);
 	undoStackInit(&redo_stack);
 	getWindowSize(&E.screenrows, &E.screencols);
@@ -1566,6 +1603,127 @@ void editorDeleteWord(void)
 	/* Skip non-separator characters backward (the word itself) */
 	while (E.cx > 0 && row->chars[E.cx - 1] != ' ')
 		editorDeleteChar();
+}
+
+/* --- Line Numbers --- */
+
+/*
+ * Compute how wide the line number gutter should be.
+ * Based on the number of lines in the file: 3 digits min, plus 1 space.
+ * Example: 1-999 lines = "  1 " (4 cols), 1000+ = " 1000 " (6 cols).
+ */
+void editorUpdateLineNumberWidth(void)
+{
+	int digits = 1;
+	int n = E.numrows;
+	while (n >= 10) { n /= 10; digits++; }
+	if (digits < 3) digits = 3;  /* minimum 3 digits wide */
+	E.line_number_width = digits + 1;  /* +1 for the space separator */
+}
+
+/* --- Word Auto-Completion --- */
+
+/*
+ * Simple word completion from the current file.
+ * Finds the partial word before the cursor, then scans all rows
+ * for words starting with that prefix. Inserts the first match.
+ *
+ * Uses a basic approach: extracts the word under cursor, scans file
+ * for matching words, cycles through matches on repeated presses.
+ */
+void editorAutoComplete(void)
+{
+	static int last_match_row = -1;
+	static int last_match_col = -1;
+	static int prefix_len_saved = 0;
+
+	if (E.cy >= E.numrows || E.cx == 0) {
+		editorSetStatusMessage("No word to complete");
+		return;
+	}
+
+	erow *cur = &E.row[E.cy];
+
+	/* Find the start of the current word (scan backward from cursor) */
+	int word_start = E.cx;
+	while (word_start > 0 && !isspace(cur->chars[word_start - 1]) &&
+	       !strchr(",.()+-/*=~%<>[];:!&|{}\"'", cur->chars[word_start - 1]))
+		word_start--;
+
+	int prefix_len = E.cx - word_start;
+	if (prefix_len == 0) {
+		editorSetStatusMessage("No word to complete");
+		return;
+	}
+
+	char *prefix = &cur->chars[word_start];
+
+	/* If this is a fresh completion (not cycling), reset state */
+	if (prefix_len != prefix_len_saved) {
+		last_match_row = -1;
+		last_match_col = -1;
+		prefix_len_saved = prefix_len;
+	}
+
+	/* Scan all rows for a word matching the prefix */
+	int start_row = (last_match_row >= 0) ? last_match_row : 0;
+	int start_col = (last_match_col >= 0) ? last_match_col + 1 : 0;
+	int found = 0;
+	int r, pass;
+
+	for (pass = 0; pass < 2 && !found; pass++) {
+		for (r = (pass == 0) ? start_row : 0; r < E.numrows && !found; r++) {
+			erow *row = &E.row[r];
+			int c_start = (pass == 0 && r == start_row) ? start_col : 0;
+
+			int c;
+			for (c = c_start; c < row->size; c++) {
+				/* Check if this position starts a word matching our prefix */
+				if (c > 0 && !isspace(row->chars[c - 1]) &&
+				    !strchr(",.()+-/*=~%<>[];:!&|{}\"'", row->chars[c - 1]))
+					continue;  /* not at word boundary */
+
+				/* Skip if this IS the word we're completing (same position) */
+				if (r == E.cy && c == word_start)
+					continue;
+
+				/* Check prefix match */
+				if (c + prefix_len > row->size)
+					continue;
+				if (strncmp(&row->chars[c], prefix, prefix_len) != 0)
+					continue;
+
+				/* Found a match — find end of the matched word */
+				int word_end = c + prefix_len;
+				while (word_end < row->size && !isspace(row->chars[word_end]) &&
+				       !strchr(",.()+-/*=~%<>[];:!&|{}\"'", row->chars[word_end]))
+					word_end++;
+
+				/* Only complete if there's something beyond the prefix */
+				if (word_end == c + prefix_len)
+					continue;
+
+				/* Insert the completion (chars after the prefix) */
+				int comp_len = word_end - (c + prefix_len);
+				int i;
+				for (i = 0; i < comp_len; i++)
+					editorInsertChar(row->chars[c + prefix_len + i]);
+
+				last_match_row = r;
+				last_match_col = c;
+				prefix_len_saved = prefix_len + comp_len;
+
+				editorSetStatusMessage("Completed: %.*s", word_end - c, &row->chars[c]);
+				found = 1;
+			}
+		}
+	}
+
+	if (!found) {
+		editorSetStatusMessage("No completion found");
+		last_match_row = -1;
+		last_match_col = -1;
+	}
 }
 
 /* --- Undo/Redo --- */
@@ -1806,7 +1964,8 @@ void editorProcessKeypress(void)
 		case MOUSE_CLICK:                   /* Mouse click — position cursor */
 			editorClearSelection();
 			E.cy = E.mouse_y + E.rowoff;
-			E.cx = E.mouse_x + E.coloff;
+			E.cx = (E.mouse_x - E.line_number_width) + E.coloff;
+			if (E.cx < 0) E.cx = 0;  /* clicked in gutter */
 			/* Clamp to file bounds */
 			if (E.cy >= E.numrows)
 				E.cy = E.numrows ? E.numrows - 1 : 0;
@@ -1899,6 +2058,10 @@ void editorProcessKeypress(void)
 		case ARROW_RIGHT:
 			editorClearSelection();
 			editorMoveCursor(c);
+			break;
+
+		case '\t':                          /* Tab — auto-complete word */
+			editorAutoComplete();
 			break;
 
 		case CTRL_KEY('l'):                 /* Refresh — no-op, redraws anyway */
