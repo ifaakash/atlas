@@ -5,12 +5,12 @@
 CC = gcc
 
 # Compiler flags 
-CFLAGS= -Wall -Wextra
+CFLAGS= -std11 -Wall -Wextra
 
 
 # Compile main.c
 main:
-	$(CC) $(CFLAGS) main.c -o main.o
+	$(CC) $(CFLAGS) main.c -o atlas
 
 clean:
-	rm -rf *.o
+	rm -f *.o atlas
