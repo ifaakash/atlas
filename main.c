@@ -8,6 +8,9 @@
 #include <sys/ioctl.h> /* ioctl, TIOCGWINSZ, struct winsize */
 #include <time.h>      /* time, time_t */
 #include <stdarg.h>    /* va_list, va_start, va_end for variadic functions */
+#include <fcntl.h>     /* open, O_RDWR, O_CREAT, O_TRUNC */
+#include <errno.h>     /* errno, for error messages on save failure */
+#include <ctype.h>     /* iscntrl — check if a character is a control character */
 
 /* Global: we need the original settings accessible from the atexit callback */
 struct termios orig_termios;
@@ -39,8 +42,32 @@ struct EditorConfig {
 
 struct EditorConfig E;
 
+/* Ctrl key strips bits 5-7, leaving only bits 0-4. So Ctrl+Q = 'q' & 0x1f = 17 */
+#define CTRL_KEY(k) ((k) & 0x1f)
+
+/*
+ * We use enum values above 127 for special keys (arrows, etc.)
+ * so they don't collide with normal ASCII characters (0-127).
+ * This lets editorReadKey return a single int that represents
+ * either a regular character OR a special key.
+ */
+enum editorKey {
+	BACKSPACE = 127,    /* ASCII DEL — what Backspace sends in raw mode */
+	ARROW_LEFT = 1000,
+	ARROW_RIGHT,
+	ARROW_UP,
+	ARROW_DOWN,
+	DEL_KEY,            /* \x1b[3~ — the Delete key */
+	HOME_KEY,           /* \x1b[1~ or \x1b[H — jump to start of line */
+	END_KEY,            /* \x1b[4~ or \x1b[F — jump to end of line */
+	PAGE_UP,            /* \x1b[5~ — scroll up one page */
+	PAGE_DOWN           /* \x1b[6~ — scroll down one page */
+};
+
 /* Forward declarations — needed when functions call others defined later in the file */
 void editorSetStatusMessage(const char *fmt, ...);
+void editorRefreshScreen(void);
+int editorReadKey(void);
 
 /* Called automatically on exit — restores the terminal to its original state */
 void disableRawMode(void)
@@ -258,6 +285,126 @@ void editorDuplicateLine(void)
 	editorInsertRow(E.cy + 1, row->chars, row->size);
 	E.cy++;  /* move to the duplicated line */
 	editorSetStatusMessage("Line duplicated");
+}
+
+/* --- File I/O --- */
+
+/*
+ * Converts all editor rows into a single string with \n between lines.
+ * Returns a malloc'd buffer — caller must free it.
+ * Sets *buflen to the total length of the string.
+ */
+char *editorRowsToString(int *buflen)
+{
+	int totlen = 0;
+	int j;
+
+	/* Calculate total length: all row sizes + one \n per row */
+	for (j = 0; j < E.numrows; j++)
+		totlen += E.row[j].size + 1;
+
+	*buflen = totlen;
+	char *buf = malloc(totlen);
+	char *p = buf;
+
+	for (j = 0; j < E.numrows; j++) {
+		memcpy(p, E.row[j].chars, E.row[j].size);
+		p += E.row[j].size;
+		*p = '\n';
+		p++;
+	}
+
+	return buf;
+}
+
+/*
+ * Prompts the user for input in the message bar.
+ * 'prompt' must contain a %s where the user's input will be shown.
+ * 'callback' is called on every keypress (used by search for incremental results).
+ * Pass NULL for callback if you just need simple text input.
+ *
+ * Returns: malloc'd string on Enter, or NULL if user pressed Escape.
+ */
+char *editorPrompt(char *prompt, void (*callback)(char *, int))
+{
+	size_t bufsize = 128;
+	char *buf = malloc(bufsize);
+	size_t buflen = 0;
+	buf[0] = '\0';
+
+	while (1) {
+		editorSetStatusMessage(prompt, buf);
+		editorRefreshScreen();
+
+		int c = editorReadKey();
+
+		if (c == DEL_KEY || c == CTRL_KEY('h') || c == BACKSPACE) {
+			/* Delete last character from input */
+			if (buflen != 0) buf[--buflen] = '\0';
+		} else if (c == '\x1b') {
+			/* Escape — cancel the prompt */
+			editorSetStatusMessage("");
+			if (callback) callback(buf, c);
+			free(buf);
+			return NULL;
+		} else if (c == '\r') {
+			/* Enter — confirm the input */
+			if (buflen != 0) {
+				editorSetStatusMessage("");
+				if (callback) callback(buf, c);
+				return buf;
+			}
+		} else if (!iscntrl(c) && c < 128) {
+			/* Regular character — add to input buffer */
+			if (buflen == bufsize - 1) {
+				bufsize *= 2;
+				buf = realloc(buf, bufsize);
+			}
+			buf[buflen++] = c;
+			buf[buflen] = '\0';
+		}
+
+		if (callback) callback(buf, c);
+	}
+}
+
+/*
+ * Save the current buffer to disk.
+ * If no filename is set, prompts for one.
+ * Uses low-level open/write/close for precise error handling.
+ *
+ * O_RDWR    — open for reading and writing
+ * O_CREAT   — create file if it doesn't exist
+ * O_TRUNC   — truncate file to zero length if it exists
+ * 0644      — file permissions: owner rw, group r, others r
+ */
+void editorSave(void)
+{
+	if (E.filename == NULL) {
+		E.filename = editorPrompt("Save as: %s (ESC to cancel)", NULL);
+		if (E.filename == NULL) {
+			editorSetStatusMessage("Save aborted");
+			return;
+		}
+	}
+
+	int len;
+	char *buf = editorRowsToString(&len);
+
+	int fd = open(E.filename, O_RDWR | O_CREAT | O_TRUNC, 0644);
+	if (fd != -1) {
+		if (write(fd, buf, len) == len) {
+			close(fd);
+			free(buf);
+			E.dirty = 0;
+			editorSetStatusMessage("%d bytes written to disk", len);
+			return;
+		}
+		close(fd);
+	}
+
+	free(buf);
+	editorSetStatusMessage("Can't save! I/O error: %s", strerror(errno));
 }
 
 /*
@@ -510,28 +657,6 @@ void enableRawMode(void)
 	tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw);
 }
 
-/* Ctrl key strips bits 5-7, leaving only bits 0-4. So Ctrl+Q = 'q' & 0x1f = 17 */
-#define CTRL_KEY(k) ((k) & 0x1f)
-
-/*
- * We use enum values above 127 for special keys (arrows, etc.)
- * so they don't collide with normal ASCII characters (0-127).
- * This lets editorReadKey return a single int that represents
- * either a regular character OR a special key.
- */
-enum editorKey {
-	BACKSPACE = 127,    /* ASCII DEL — what Backspace sends in raw mode */
-	ARROW_LEFT = 1000,
-	ARROW_RIGHT,
-	ARROW_UP,
-	ARROW_DOWN,
-	DEL_KEY,            /* \x1b[3~ — the Delete key */
-	HOME_KEY,           /* \x1b[1~ or \x1b[H — jump to start of line */
-	END_KEY,            /* \x1b[4~ or \x1b[F — jump to end of line */
-	PAGE_UP,            /* \x1b[5~ — scroll up one page */
-	PAGE_DOWN           /* \x1b[6~ — scroll down one page */
-};
-
 /*
  * Reads a single keypress and returns it.
  * Regular keys return their ASCII value.
@@ -680,6 +805,13 @@ void initEditor(void)
  */
 void editorProcessKeypress(void)
 {
+	/*
+	 * quit_times: safety counter for quitting with unsaved changes.
+	 * Must press Ctrl+Q twice to force-quit a dirty buffer.
+	 * Resets to 1 whenever any other key is pressed.
+	 */
+	static int quit_times = 1;
+
 	int c = editorReadKey();
 
 	switch (c) {
@@ -688,9 +820,19 @@ void editorProcessKeypress(void)
 			break;
 
 		case CTRL_KEY('q'):                 /* Quit */
+			if (E.dirty && quit_times > 0) {
+				editorSetStatusMessage(
+					"WARNING! Unsaved changes. Press Ctrl-Q again to quit.");
+				quit_times--;
+				return;  /* return early — don't reset quit_times below */
+			}
 			write(STDOUT_FILENO, "\x1b[2J", 4);   /* clear screen */
 			write(STDOUT_FILENO, "\x1b[H", 3);    /* cursor home */
 			exit(0);
+			break;
+
+		case CTRL_KEY('s'):                 /* Save */
+			editorSave();
 			break;
 
 		case CTRL_KEY('d'):                 /* Duplicate line */
@@ -739,6 +881,9 @@ void editorProcessKeypress(void)
 			editorInsertChar(c);            /* Normal character — insert it */
 			break;
 	}
+
+	/* Any key other than Ctrl+Q resets the quit confirmation counter */
+	quit_times = 1;
 }
 
 int main(int argc, char *argv[])
