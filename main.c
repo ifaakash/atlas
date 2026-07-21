@@ -138,6 +138,7 @@ typedef struct {
 	int c;                /* the character (for char insert/delete) */
 	char *str;            /* saved text data — NULL if not needed */
 	int str_len;          /* length of str */
+	int indent;           /* auto-indent char count (for UNDO_INSERT_NEWLINE) */
 } UndoEntry;
 
 /*
@@ -672,13 +673,11 @@ void editorDeleteChar(void)
 /* Insert a newline — splits the current row at the cursor position */
 void editorInsertNewline(void)
 {
-	/* Record undo — old_cx tells us the split point for reversal */
+	/* Save cursor BEFORE the operation for undo */
 	UndoEntry ue = {0};
 	ue.type = UNDO_INSERT_NEWLINE;
 	ue.old_cx = E.cx;
 	ue.old_cy = E.cy;
-	undoStackPush(&undo_stack, ue);
-	undoStackClear(&redo_stack);
 
 	if (E.cx == 0) {
 		/* Cursor at start of line: insert a blank line above */
@@ -699,8 +698,7 @@ void editorInsertNewline(void)
 
 	/*
 	 * Auto-indent: copy leading whitespace from the previous line.
-	 * Scans the line we just left for spaces/tabs at the beginning,
-	 * then inserts them into the new line.
+	 * We count the indent BEFORE inserting so undo knows how many chars to strip.
 	 */
 	erow *prev = &E.row[E.cy - 1];
 	int indent = 0;
@@ -715,6 +713,11 @@ void editorInsertNewline(void)
 	} else {
 		E.cx = 0;
 	}
+
+	/* Record undo AFTER auto-indent so indent count is captured */
+	ue.indent = indent;
+	undoStackPush(&undo_stack, ue);
+	undoStackClear(&redo_stack);
 }
 
 /*
@@ -1169,12 +1172,7 @@ void editorRefreshScreen(void)
 			if (in_sel) abAppend(&ab, "\x1b[m", 3);  /* reset if row ended in selection */
 			abAppend(&ab, "\x1b[39m", 5);  /* reset foreground color */
 		} else {
-			/* Past end of file — draw tilde with gutter padding */
-			char padding[16];
-			int padlen = snprintf(padding, sizeof(padding), "%*s",
-			                     E.line_number_width, "");
-			abAppend(&ab, padding, padlen);
-			abAppend(&ab, "~", 1);
+			/* Past end of file — empty line (just gutter space) */
 		}
 
 		/* Clear the rest of this line */
@@ -1790,11 +1788,24 @@ void editorUndo(void)
 
 		case UNDO_INSERT_NEWLINE:
 			/* Undo: rejoin the two lines that were split */
+			re.indent = ue.indent;  /* preserve indent count for redo */
 			if (ue.old_cx == 0) {
 				/* Was a blank line inserted above — just delete it */
 				editorDeleteRow(ue.old_cy);
 			} else {
-				/* Rejoin: append row[old_cy+1] to row[old_cy], then delete row[old_cy+1] */
+				/*
+				 * Strip auto-indent chars from the new row before rejoining.
+				 * The indent chars were inserted AFTER the split, so we need
+				 * to remove them to get back to the original text.
+				 */
+				erow *newrow = &E.row[ue.old_cy + 1];
+				if (ue.indent > 0 && newrow->size >= ue.indent) {
+					memmove(newrow->chars, &newrow->chars[ue.indent],
+					        newrow->size - ue.indent + 1);
+					newrow->size -= ue.indent;
+				}
+
+				/* Rejoin: append row[old_cy+1] to row[old_cy], then delete */
 				editorRowAppendString(&E.row[ue.old_cy],
 					E.row[ue.old_cy + 1].chars, E.row[ue.old_cy + 1].size);
 				editorDeleteRow(ue.old_cy + 1);
@@ -1869,6 +1880,7 @@ void editorRedo(void)
 
 		case UNDO_INSERT_NEWLINE:
 			/* Redo: re-split the line */
+			ue.indent = re.indent;  /* preserve indent count */
 			if (re.old_cx == 0) {
 				editorInsertRow(re.old_cy, "", 0);
 			} else {
@@ -1881,7 +1893,16 @@ void editorRedo(void)
 				editorUpdateSyntax(row, re.old_cy);
 			}
 			E.cy = re.old_cy + 1;
-			E.cx = 0;
+			/* Re-insert auto-indent chars */
+			if (re.indent > 0 && re.old_cy < E.numrows) {
+				erow *prev = &E.row[re.old_cy];
+				int i;
+				for (i = 0; i < re.indent && i < prev->size; i++)
+					editorRowInsertChar(&E.row[E.cy], i, prev->chars[i]);
+				E.cx = re.indent;
+			} else {
+				E.cx = 0;
+			}
 			break;
 
 		case UNDO_DUPLICATE_LINE:
