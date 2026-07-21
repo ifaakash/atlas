@@ -239,6 +239,66 @@ void editorMoveCursor(int key)
 		E.cx = rowlen;
 }
 
+/*
+ * Move cursor left by one word.
+ * Skips whitespace first, then skips the word (non-whitespace/non-separator chars).
+ * Stops at the beginning of the word.
+ */
+void editorMoveWordLeft(void)
+{
+	if (E.cy >= E.numrows) return;
+
+	/* If at start of line, jump to end of previous line */
+	if (E.cx == 0) {
+		if (E.cy > 0) {
+			E.cy--;
+			E.cx = E.row[E.cy].size;
+		}
+		return;
+	}
+
+	erow *row = &E.row[E.cy];
+
+	/* Skip whitespace backward */
+	while (E.cx > 0 && isspace(row->chars[E.cx - 1]))
+		E.cx--;
+
+	/* Skip word characters backward */
+	while (E.cx > 0 && !isspace(row->chars[E.cx - 1]) &&
+	       !strchr(",.()+-/*=~%<>[];:!&|{}\"'", row->chars[E.cx - 1]))
+		E.cx--;
+}
+
+/*
+ * Move cursor right by one word.
+ * Skips the current word first, then skips whitespace.
+ * Stops at the beginning of the next word.
+ */
+void editorMoveWordRight(void)
+{
+	if (E.cy >= E.numrows) return;
+
+	erow *row = &E.row[E.cy];
+
+	/* If at end of line, jump to start of next line */
+	if (E.cx >= row->size) {
+		if (E.cy < E.numrows - 1) {
+			E.cy++;
+			E.cx = 0;
+		}
+		return;
+	}
+
+	/* Skip word characters forward */
+	while (E.cx < row->size && !isspace(row->chars[E.cx]) &&
+	       !strchr(",.()+-/*=~%<>[];:!&|{}\"'", row->chars[E.cx]))
+		E.cx++;
+
+	/* Skip whitespace forward */
+	while (E.cx < row->size && isspace(row->chars[E.cx]))
+		E.cx++;
+}
+
 /* --- Word Delete --- */
 
 /*

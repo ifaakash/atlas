@@ -122,6 +122,26 @@ void editorProcessKeypress(void)
 			}
 			break;
 
+		case ALT_LEFT:                      /* Option+Left — jump word left */
+			editorClearSelection();
+			editorMoveWordLeft();
+			break;
+
+		case ALT_RIGHT:                     /* Option+Right — jump word right */
+			editorClearSelection();
+			editorMoveWordRight();
+			break;
+
+		case SHIFT_ALT_LEFT:                /* Shift+Option+Left — select word left */
+			editorStartSelection();
+			editorMoveWordLeft();
+			break;
+
+		case SHIFT_ALT_RIGHT:               /* Shift+Option+Right — select word right */
+			editorStartSelection();
+			editorMoveWordRight();
+			break;
+
 		case ALT_BACKSPACE:                 /* Option+Backspace — delete word */
 		case CTRL_KEY('w'):                 /* Ctrl+W — also delete word (universal) */
 			editorClearSelection();

@@ -163,7 +163,11 @@ enum editorKey {
 	SHIFT_DOWN,         /* \x1b[1;2B — Shift+Down */
 	ALT_BACKSPACE,      /* \x1b + DEL(127) — Option+Backspace for word delete */
 	MOUSE_SCROLL_UP,    /* mouse wheel up (SGR button 64) */
-	MOUSE_SCROLL_DOWN   /* mouse wheel down (SGR button 65) */
+	MOUSE_SCROLL_DOWN,  /* mouse wheel down (SGR button 65) */
+	ALT_LEFT,           /* \x1b[1;3D — Option+Left (word jump) */
+	ALT_RIGHT,          /* \x1b[1;3C — Option+Right (word jump) */
+	SHIFT_ALT_LEFT,     /* \x1b[1;4D — Shift+Option+Left (word select) */
+	SHIFT_ALT_RIGHT     /* \x1b[1;4C — Shift+Option+Right (word select) */
 };
 
 struct AppendBuffer {
@@ -208,6 +212,8 @@ void editorDeleteChar(void);
 void editorInsertNewline(void);
 void editorDuplicateLine(void);
 void editorMoveCursor(int key);
+void editorMoveWordLeft(void);
+void editorMoveWordRight(void);
 void editorDeleteWord(void);
 void editorAutoComplete(void);
 void editorUndo(void);

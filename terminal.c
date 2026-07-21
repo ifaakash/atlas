@@ -181,15 +181,26 @@ int editorReadKey(void)
 					if (read(STDIN_FILENO, &dir, 1) != 1) return '\x1b';
 
 					if (mod == '2') {
-						/* Shift+Arrow — for selection */
+						/* Shift+Arrow — character selection */
 						switch (dir) {
 							case 'A': return SHIFT_UP;
 							case 'B': return SHIFT_DOWN;
 							case 'C': return SHIFT_RIGHT;
 							case 'D': return SHIFT_LEFT;
 						}
+					} else if (mod == '3') {
+						/* Alt/Option+Arrow — word jump */
+						switch (dir) {
+							case 'C': return ALT_RIGHT;
+							case 'D': return ALT_LEFT;
+						}
+					} else if (mod == '4') {
+						/* Shift+Alt/Option+Arrow — word selection */
+						switch (dir) {
+							case 'C': return SHIFT_ALT_RIGHT;
+							case 'D': return SHIFT_ALT_LEFT;
+						}
 					}
-					/* Other modifiers (Ctrl=5, Alt=3) — ignore for now */
 				}
 			} else {
 				/* Simple escape: \x1b [ letter */
