@@ -4,8 +4,10 @@
 #include <stdlib.h>    /* atexit() */
 #include <unistd.h>    /* read(), STDIN_FILENO */
 #include <termios.h>   /* struct termios, tcgetattr, tcsetattr */
-#include <string.h>    /* memcpy */
+#include <string.h>    /* memcpy, strdup */
 #include <sys/ioctl.h> /* ioctl, TIOCGWINSZ, struct winsize */
+#include <time.h>      /* time, time_t */
+#include <stdarg.h>    /* va_list, va_start, va_end for variadic functions */
 
 /* Global: we need the original settings accessible from the atexit callback */
 struct termios orig_termios;
@@ -29,6 +31,10 @@ struct EditorConfig {
 	int screencols;     /* terminal width */
 	int numrows;        /* how many rows of text are loaded */
 	erow *row;          /* dynamic array of rows — grown with realloc */
+	char *filename;     /* currently open file, NULL if new/empty */
+	int dirty;          /* counts unsaved modifications, 0 = clean */
+	char statusmsg[80]; /* message bar text (shown below status bar) */
+	time_t statusmsg_time; /* when message was set — auto-expires after 5 seconds */
 };
 
 struct EditorConfig E;
@@ -116,6 +122,9 @@ void editorAppendRow(char *s, int len)
  */
 void editorOpen(char *filename)
 {
+	free(E.filename);
+	E.filename = strdup(filename);  /* store filename for status bar and saving */
+
 	FILE *fp = fopen(filename, "r");
 	if (!fp) return;
 
@@ -139,6 +148,84 @@ void editorOpen(char *filename)
 
 	free(line);
 	fclose(fp);
+}
+
+/*
+ * Sets a message to display in the message bar.
+ * Uses printf-style format string with variadic arguments.
+ * The message auto-expires after 5 seconds in editorDrawMessageBar.
+ *
+ * va_list/va_start/va_end: C mechanism for functions that accept
+ * a variable number of arguments (like printf itself).
+ * vsnprintf: like snprintf, but takes a va_list instead of ... args.
+ */
+void editorSetStatusMessage(const char *fmt, ...)
+{
+	va_list ap;
+	va_start(ap, fmt);
+	vsnprintf(E.statusmsg, sizeof(E.statusmsg), fmt, ap);
+	va_end(ap);
+	E.statusmsg_time = time(NULL);
+}
+
+/*
+ * Draws the status bar — an inverted-color line at the bottom of the editor.
+ *
+ * Left side:  filename and line count
+ * Right side: current line / total lines
+ *
+ * \x1b[7m = "reverse video" (swap foreground/background colors)
+ * \x1b[m  = reset all formatting back to normal
+ */
+void editorDrawStatusBar(struct AppendBuffer *ab)
+{
+	abAppend(ab, "\x1b[7m", 4);  /* switch to inverted colors */
+
+	char status[80], rstatus[80];
+
+	/* Left side: filename + line count + dirty indicator */
+	int len = snprintf(status, sizeof(status), "%.20s - %d lines %s",
+	                   E.filename ? E.filename : "[No Name]",
+	                   E.numrows,
+	                   E.dirty ? "(modified)" : "");
+
+	/* Right side: current position */
+	int rlen = snprintf(rstatus, sizeof(rstatus), "%d/%d",
+	                    E.cy + 1, E.numrows);
+
+	if (len > E.screencols) len = E.screencols;
+	abAppend(ab, status, len);
+
+	/* Fill the rest of the bar with spaces (keeps the inverted background) */
+	while (len < E.screencols) {
+		if (E.screencols - len == rlen) {
+			/* Right-align the position info */
+			abAppend(ab, rstatus, rlen);
+			break;
+		} else {
+			abAppend(ab, " ", 1);
+			len++;
+		}
+	}
+
+	abAppend(ab, "\x1b[m", 3);  /* reset formatting */
+	abAppend(ab, "\r\n", 2);    /* newline before message bar */
+}
+
+/*
+ * Draws the message bar — one line below the status bar.
+ * Shows E.statusmsg if it was set within the last 5 seconds.
+ */
+void editorDrawMessageBar(struct AppendBuffer *ab)
+{
+	abAppend(ab, "\x1b[K", 3);  /* clear this line */
+
+	int msglen = strlen(E.statusmsg);
+	if (msglen > E.screencols) msglen = E.screencols;
+
+	/* Only show message if it's less than 5 seconds old */
+	if (msglen && time(NULL) - E.statusmsg_time < 5)
+		abAppend(ab, E.statusmsg, msglen);
 }
 
 /*
@@ -200,13 +287,16 @@ void editorRefreshScreen(void)
 		/* Clear the rest of this line */
 		abAppend(&ab, "\x1b[K", 3);
 
-		if (y < E.screenrows - 1) {
-			abAppend(&ab, "\r\n", 2);
-		}
+		/* Every row gets \r\n — including the last, because status bar follows */
+		abAppend(&ab, "\r\n", 2);
 	}
 
+	/* 4. Draw status bar and message bar */
+	editorDrawStatusBar(&ab);
+	editorDrawMessageBar(&ab);
+
 	/*
-	 * 4. Position cursor on screen.
+	 * 5. Position cursor on screen.
 	 * E.cy/E.cx are file coordinates. Subtract the scroll offset
 	 * to get screen coordinates. Add 1 because terminal is 1-based.
 	 */
@@ -392,7 +482,12 @@ void initEditor(void)
 	E.coloff = 0;
 	E.numrows = 0;
 	E.row = NULL;
+	E.filename = NULL;
+	E.dirty = 0;
+	E.statusmsg[0] = '\0';
+	E.statusmsg_time = 0;
 	getWindowSize(&E.screenrows, &E.screencols);
+	E.screenrows -= 2;  /* reserve 2 bottom rows for status bar + message bar */
 }
 
 int main(int argc, char *argv[])
@@ -404,6 +499,8 @@ int main(int argc, char *argv[])
 	if (argc >= 2) {
 		editorOpen(argv[1]);
 	}
+
+	editorSetStatusMessage("HELP: Ctrl-Q = quit");
 
 	while (1) {
 		editorRefreshScreen();
