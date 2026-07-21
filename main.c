@@ -22,7 +22,9 @@ typedef struct {
 
 /* All editor state lives here — one struct, easy to find, easy to refactor later */
 struct EditorConfig {
-	int cx, cy;         /* cursor position (column, row) */
+	int cx, cy;         /* cursor position (column, row) — in FILE coordinates */
+	int rowoff;         /* row offset — which file row is at the top of screen */
+	int coloff;         /* col offset — which file col is at the left of screen */
 	int screenrows;     /* terminal height */
 	int screencols;     /* terminal width */
 	int numrows;        /* how many rows of text are loaded */
@@ -139,8 +141,36 @@ void editorOpen(char *filename)
 	fclose(fp);
 }
 
+/*
+ * Adjusts E.rowoff and E.coloff so the cursor is always visible on screen.
+ * Called at the top of every screen refresh.
+ *
+ * Think of it like a camera following a character in a game:
+ * the viewport shifts when the cursor reaches the edge.
+ */
+void editorScroll(void)
+{
+	/* Cursor moved above the visible area — scroll up */
+	if (E.cy < E.rowoff)
+		E.rowoff = E.cy;
+
+	/* Cursor moved below the visible area — scroll down */
+	if (E.cy >= E.rowoff + E.screenrows)
+		E.rowoff = E.cy - E.screenrows + 1;
+
+	/* Cursor moved left of the visible area — scroll left */
+	if (E.cx < E.coloff)
+		E.coloff = E.cx;
+
+	/* Cursor moved right of the visible area — scroll right */
+	if (E.cx >= E.coloff + E.screencols)
+		E.coloff = E.cx - E.screencols + 1;
+}
+
 void editorRefreshScreen(void)
 {
+	editorScroll();
+
 	struct AppendBuffer ab = {NULL, 0};
 
 	/* 1. Hide cursor — prevents flickering during redraw */
@@ -152,13 +182,16 @@ void editorRefreshScreen(void)
 	/* 3. Draw each row — file content if available, tilde if past end of file */
 	int y;
 	for (y = 0; y < E.screenrows; y++) {
-		if (y < E.numrows) {
-			/* This row has file content — draw it */
-			int len = E.row[y].size;
-			/* Truncate if the line is longer than the screen */
+		int filerow = y + E.rowoff;  /* map screen row to file row */
+
+		if (filerow < E.numrows) {
+			/* This row has file content — draw it, applying horizontal scroll */
+			int len = E.row[filerow].size - E.coloff;
+			if (len < 0) len = 0;            /* line is shorter than coloff */
 			if (len > E.screencols)
-				len = E.screencols;
-			abAppend(&ab, E.row[y].chars, len);
+				len = E.screencols;           /* truncate to screen width */
+			if (len > 0)
+				abAppend(&ab, &E.row[filerow].chars[E.coloff], len);
 		} else {
 			/* Past end of file — draw tilde */
 			abAppend(&ab, "~", 1);
@@ -173,13 +206,14 @@ void editorRefreshScreen(void)
 	}
 
 	/*
-	 * 4. Position cursor at E.cy, E.cx
-	 * Escape sequence is \x1b[{row};{col}H — but terminal rows/cols are 1-based,
-	 * while our E.cx/E.cy are 0-based, so we add 1 to each.
-	 * snprintf writes formatted text into a buffer — like printf but to a string.
+	 * 4. Position cursor on screen.
+	 * E.cy/E.cx are file coordinates. Subtract the scroll offset
+	 * to get screen coordinates. Add 1 because terminal is 1-based.
 	 */
 	char buf[32];
-	snprintf(buf, sizeof(buf), "\x1b[%d;%dH", E.cy + 1, E.cx + 1);
+	snprintf(buf, sizeof(buf), "\x1b[%d;%dH",
+	         (E.cy - E.rowoff) + 1,
+	         (E.cx - E.coloff) + 1);
 	abAppend(&ab, buf, strlen(buf));
 
 	/* 5. Show cursor again */
@@ -299,24 +333,52 @@ int editorReadKey(void)
 
 /*
  * Updates cursor position based on which key was pressed.
- * Bounds checking: don't let the cursor go off-screen.
+ * Bounds checking is now against file content, not screen size.
+ *
+ * Also handles line wrapping:
+ *   - Right arrow at end of line -> start of next line
+ *   - Left arrow at start of line -> end of previous line
+ *
+ * After vertical movement, snaps cx to end of line if the
+ * destination line is shorter than the current cx position.
  */
 void editorMoveCursor(int key)
 {
+	/* Get the current row (NULL if cursor is past end of file) */
+	erow *row = (E.cy < E.numrows) ? &E.row[E.cy] : NULL;
+
 	switch (key) {
 		case ARROW_LEFT:
-			if (E.cx > 0) E.cx--;
+			if (E.cx > 0) {
+				E.cx--;
+			} else if (E.cy > 0) {
+				/* Wrap to end of previous line */
+				E.cy--;
+				E.cx = E.row[E.cy].size;
+			}
 			break;
 		case ARROW_RIGHT:
-			if (E.cx < E.screencols - 1) E.cx++;
+			if (row && E.cx < row->size) {
+				E.cx++;
+			} else if (row && E.cx == row->size && E.cy < E.numrows - 1) {
+				/* Wrap to start of next line */
+				E.cy++;
+				E.cx = 0;
+			}
 			break;
 		case ARROW_UP:
 			if (E.cy > 0) E.cy--;
 			break;
 		case ARROW_DOWN:
-			if (E.cy < E.screenrows - 1) E.cy++;
+			if (E.cy < E.numrows - 1) E.cy++;
 			break;
 	}
+
+	/* Snap cx to end of line if we moved to a shorter line */
+	row = (E.cy < E.numrows) ? &E.row[E.cy] : NULL;
+	int rowlen = row ? row->size : 0;
+	if (E.cx > rowlen)
+		E.cx = rowlen;
 }
 
 /*
@@ -326,6 +388,8 @@ void initEditor(void)
 {
 	E.cx = 0;
 	E.cy = 0;
+	E.rowoff = 0;
+	E.coloff = 0;
 	E.numrows = 0;
 	E.row = NULL;
 	getWindowSize(&E.screenrows, &E.screencols);
