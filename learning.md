@@ -1,4 +1,4 @@
-# CFLAGS for C
+## CFLAGS for C
 
 ```bash
 | Standard | Year      | Example Flag |
@@ -9,6 +9,10 @@
 | C17      | 2018      | `-std=c17`   |
 | C23      | 2024      | `-std=c23`   |
 ```
+
+### Why specify -std?
+
+Without it, GCC uses its default language mode, which can vary depending on the compiler version and may include GCC-specific extensions.
 
 The declaration:
 
@@ -29,3 +33,7 @@ gcc -std=c11 main.c```
 
 It compiles successfully because C11 includes that feature.
 
+### Why -g flag in CFLAGS?
+The -g flag tells the compiler to include debugging information in the executable.
+
+This information is not used by your program while it runs. Instead, it's used by debuggers like GDB (GNU Debugger) so they can show you your source code, variable values, function names, and line numbers.
