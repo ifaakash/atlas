@@ -99,7 +99,56 @@ struct EditorConfig {
 	char statusmsg[80]; /* message bar text (shown below status bar) */
 	time_t statusmsg_time; /* when message was set — auto-expires after 5 seconds */
 	struct editorSyntax *syntax;  /* current filetype syntax, NULL if none detected */
+
+	/* Undo/redo stacks — defined below */
+	/* (forward-declared here, actual types defined right after EditorConfig) */
 };
+
+/* --- Undo/Redo system --- */
+
+#define UNDO_MAX 1000
+
+/*
+ * Each undo entry type corresponds to one high-level edit action.
+ * We record at the high level so one keypress = one undo entry.
+ */
+enum UndoType {
+	UNDO_INSERT_CHAR,     /* user typed a character */
+	UNDO_DELETE_CHAR,     /* backspace deleted a char (cx > 0) */
+	UNDO_JOIN_LINES,      /* backspace at col 0 joined current line to previous */
+	UNDO_INSERT_NEWLINE,  /* Enter split a line or inserted blank line */
+	UNDO_DUPLICATE_LINE   /* Ctrl+D duplicated a line */
+};
+
+/*
+ * Stores everything needed to reverse (or re-apply) one edit operation.
+ * old_cx/old_cy = cursor BEFORE the edit, so we can restore it on undo.
+ * str = heap-allocated copy of text data (for line join operations).
+ */
+typedef struct {
+	enum UndoType type;
+	int old_cx, old_cy;   /* cursor position before the edit */
+	int c;                /* the character (for char insert/delete) */
+	char *str;            /* saved text data — NULL if not needed */
+	int str_len;          /* length of str */
+} UndoEntry;
+
+/*
+ * Ring buffer stack — fixed size, auto-evicts oldest when full.
+ * start = index of oldest entry, count = how many valid entries.
+ * Push writes at (start + count) % UNDO_MAX.
+ * Pop reads from (start + count - 1) % UNDO_MAX.
+ */
+typedef struct {
+	UndoEntry entries[UNDO_MAX];
+	int start;
+	int count;
+} UndoStack;
+
+/* Now we can add the undo/redo fields — but since EditorConfig is already
+ * defined above, we use a separate global. This avoids circular definition. */
+UndoStack undo_stack;
+UndoStack redo_stack;
 
 struct EditorConfig E;
 
@@ -129,6 +178,59 @@ enum editorKey {
 void editorSetStatusMessage(const char *fmt, ...);
 void editorRefreshScreen(void);
 int editorReadKey(void);
+void editorUpdateSyntax(erow *row, int row_index);
+
+/* --- Undo stack operations --- */
+
+void undoStackInit(UndoStack *s)
+{
+	s->start = 0;
+	s->count = 0;
+	memset(s->entries, 0, sizeof(s->entries));
+}
+
+/* Push an entry onto the stack. If full, evicts the oldest entry. */
+void undoStackPush(UndoStack *s, UndoEntry entry)
+{
+	int idx;
+	if (s->count == UNDO_MAX) {
+		/* Stack full — free oldest entry's string and overwrite */
+		free(s->entries[s->start].str);
+		s->entries[s->start].str = NULL;
+		idx = s->start;
+		s->start = (s->start + 1) % UNDO_MAX;
+	} else {
+		idx = (s->start + s->count) % UNDO_MAX;
+		s->count++;
+	}
+	/* Free any leftover string at this slot (defensive) */
+	free(s->entries[idx].str);
+	s->entries[idx] = entry;
+}
+
+/* Pop the most recent entry. Returns 1 on success, 0 if empty. */
+int undoStackPop(UndoStack *s, UndoEntry *out)
+{
+	if (s->count == 0) return 0;
+	s->count--;
+	int idx = (s->start + s->count) % UNDO_MAX;
+	*out = s->entries[idx];
+	s->entries[idx].str = NULL;  /* prevent double-free */
+	return 1;
+}
+
+/* Clear the stack and free all stored strings. */
+void undoStackClear(UndoStack *s)
+{
+	int i;
+	for (i = 0; i < s->count; i++) {
+		int idx = (s->start + i) % UNDO_MAX;
+		free(s->entries[idx].str);
+		s->entries[idx].str = NULL;
+	}
+	s->start = 0;
+	s->count = 0;
+}
 
 /* Called automatically on exit — restores the terminal to its original state */
 void disableRawMode(void)
@@ -491,6 +593,15 @@ void editorRowAppendString(erow *row, char *s, int len)
 /* Insert a character at the current cursor position */
 void editorInsertChar(int c)
 {
+	/* Record undo BEFORE making the change */
+	UndoEntry ue = {0};
+	ue.type = UNDO_INSERT_CHAR;
+	ue.old_cx = E.cx;
+	ue.old_cy = E.cy;
+	ue.c = c;
+	undoStackPush(&undo_stack, ue);
+	undoStackClear(&redo_stack);  /* new edit kills redo history */
+
 	/* If cursor is at the very end of the file, add a new empty row first */
 	if (E.cy == E.numrows)
 		editorInsertRow(E.numrows, "", 0);
@@ -508,13 +619,29 @@ void editorDeleteChar(void)
 	if (E.cy == E.numrows) return;          /* past end of file */
 	if (E.cx == 0 && E.cy == 0) return;    /* top-left corner, nothing to delete */
 
+	UndoEntry ue = {0};
+	ue.old_cx = E.cx;
+	ue.old_cy = E.cy;
+
 	erow *row = &E.row[E.cy];
 	if (E.cx > 0) {
 		/* Normal case: delete character to the left */
+		ue.type = UNDO_DELETE_CHAR;
+		ue.c = row->chars[E.cx - 1];  /* save the char we're about to delete */
+		undoStackPush(&undo_stack, ue);
+		undoStackClear(&redo_stack);
+
 		editorRowDeleteChar(row, E.cx - 1);
 		E.cx--;
 	} else {
 		/* At column 0: join this line with the previous line */
+		ue.type = UNDO_JOIN_LINES;
+		ue.str = malloc(row->size);       /* save current row before it's destroyed */
+		memcpy(ue.str, row->chars, row->size);
+		ue.str_len = row->size;
+		undoStackPush(&undo_stack, ue);
+		undoStackClear(&redo_stack);
+
 		E.cx = E.row[E.cy - 1].size;  /* cursor goes to end of previous line */
 		editorRowAppendString(&E.row[E.cy - 1], row->chars, row->size);
 		editorDeleteRow(E.cy);
@@ -525,6 +652,14 @@ void editorDeleteChar(void)
 /* Insert a newline — splits the current row at the cursor position */
 void editorInsertNewline(void)
 {
+	/* Record undo — old_cx tells us the split point for reversal */
+	UndoEntry ue = {0};
+	ue.type = UNDO_INSERT_NEWLINE;
+	ue.old_cx = E.cx;
+	ue.old_cy = E.cy;
+	undoStackPush(&undo_stack, ue);
+	undoStackClear(&redo_stack);
+
 	if (E.cx == 0) {
 		/* Cursor at start of line: insert a blank line above */
 		editorInsertRow(E.cy, "", 0);
@@ -537,6 +672,7 @@ void editorInsertNewline(void)
 		row = &E.row[E.cy];  /* re-read — realloc in editorInsertRow may have moved it */
 		row->size = E.cx;
 		row->chars[row->size] = '\0';
+		editorUpdateSyntax(row, E.cy);
 	}
 
 	E.cy++;
@@ -550,6 +686,13 @@ void editorInsertNewline(void)
 void editorDuplicateLine(void)
 {
 	if (E.cy >= E.numrows) return;  /* nothing to duplicate */
+
+	UndoEntry ue = {0};
+	ue.type = UNDO_DUPLICATE_LINE;
+	ue.old_cx = E.cx;
+	ue.old_cy = E.cy;
+	undoStackPush(&undo_stack, ue);
+	undoStackClear(&redo_stack);
 
 	erow *row = &E.row[E.cy];
 	editorInsertRow(E.cy + 1, row->chars, row->size);
@@ -1182,8 +1325,181 @@ void initEditor(void)
 	E.statusmsg[0] = '\0';
 	E.statusmsg_time = 0;
 	E.syntax = NULL;
+	undoStackInit(&undo_stack);
+	undoStackInit(&redo_stack);
 	getWindowSize(&E.screenrows, &E.screencols);
 	E.screenrows -= 2;  /* reserve 2 bottom rows for status bar + message bar */
+}
+
+/* --- Undo/Redo --- */
+
+/*
+ * Undo the most recent edit operation.
+ * Pops from undo_stack, reverses the operation using low-level primitives
+ * (NOT the high-level functions, to avoid recording undo entries for undo itself),
+ * then pushes a redo entry so the operation can be re-applied.
+ */
+void editorUndo(void)
+{
+	UndoEntry ue;
+	if (!undoStackPop(&undo_stack, &ue)) {
+		editorSetStatusMessage("Nothing to undo");
+		return;
+	}
+
+	/* Build redo entry — same type and data, so redo can re-apply */
+	UndoEntry re = {0};
+	re.type = ue.type;
+	re.old_cx = ue.old_cx;
+	re.old_cy = ue.old_cy;
+	re.c = ue.c;
+
+	switch (ue.type) {
+		case UNDO_INSERT_CHAR:
+			/* Undo: remove the character that was inserted */
+			editorRowDeleteChar(&E.row[ue.old_cy], ue.old_cx);
+			E.cx = ue.old_cx;
+			E.cy = ue.old_cy;
+			break;
+
+		case UNDO_DELETE_CHAR:
+			/* Undo: re-insert the character that was deleted */
+			editorRowInsertChar(&E.row[ue.old_cy], ue.old_cx - 1, ue.c);
+			E.cx = ue.old_cx;
+			E.cy = ue.old_cy;
+			break;
+
+		case UNDO_JOIN_LINES:
+			/* Undo: split the joined line back into two */
+			{
+				/* The join appended ue.str to row[old_cy-1].
+				 * To reverse: truncate row[old_cy-1] and insert row[old_cy] with ue.str. */
+				int join_col = E.row[ue.old_cy - 1].size - ue.str_len;
+
+				/* Insert the saved row text back */
+				editorInsertRow(ue.old_cy, ue.str, ue.str_len);
+
+				/* Truncate the previous row at the join point */
+				E.row[ue.old_cy - 1].size = join_col;
+				E.row[ue.old_cy - 1].chars[join_col] = '\0';
+				editorUpdateSyntax(&E.row[ue.old_cy - 1], ue.old_cy - 1);
+
+				/* Save the string for redo */
+				re.str = malloc(ue.str_len);
+				memcpy(re.str, ue.str, ue.str_len);
+				re.str_len = ue.str_len;
+			}
+			E.cx = ue.old_cx;
+			E.cy = ue.old_cy;
+			break;
+
+		case UNDO_INSERT_NEWLINE:
+			/* Undo: rejoin the two lines that were split */
+			if (ue.old_cx == 0) {
+				/* Was a blank line inserted above — just delete it */
+				editorDeleteRow(ue.old_cy);
+			} else {
+				/* Rejoin: append row[old_cy+1] to row[old_cy], then delete row[old_cy+1] */
+				editorRowAppendString(&E.row[ue.old_cy],
+					E.row[ue.old_cy + 1].chars, E.row[ue.old_cy + 1].size);
+				editorDeleteRow(ue.old_cy + 1);
+			}
+			E.cx = ue.old_cx;
+			E.cy = ue.old_cy;
+			break;
+
+		case UNDO_DUPLICATE_LINE:
+			/* Undo: delete the duplicated row */
+			editorDeleteRow(ue.old_cy + 1);
+			E.cx = ue.old_cx;
+			E.cy = ue.old_cy;
+			break;
+	}
+
+	free(ue.str);
+	undoStackPush(&redo_stack, re);
+}
+
+/*
+ * Redo the most recently undone operation.
+ * Pops from redo_stack, re-applies the operation, pushes undo entry back.
+ */
+void editorRedo(void)
+{
+	UndoEntry re;
+	if (!undoStackPop(&redo_stack, &re)) {
+		editorSetStatusMessage("Nothing to redo");
+		return;
+	}
+
+	/* Build undo entry so this can be undone again */
+	UndoEntry ue = {0};
+	ue.type = re.type;
+	ue.old_cx = re.old_cx;
+	ue.old_cy = re.old_cy;
+	ue.c = re.c;
+
+	switch (re.type) {
+		case UNDO_INSERT_CHAR:
+			/* Redo: re-insert the character */
+			if (re.old_cy == E.numrows)
+				editorInsertRow(E.numrows, "", 0);
+			editorRowInsertChar(&E.row[re.old_cy], re.old_cx, re.c);
+			E.cx = re.old_cx + 1;
+			E.cy = re.old_cy;
+			break;
+
+		case UNDO_DELETE_CHAR:
+			/* Redo: re-delete the character */
+			ue.c = E.row[re.old_cy].chars[re.old_cx - 1];
+			editorRowDeleteChar(&E.row[re.old_cy], re.old_cx - 1);
+			E.cx = re.old_cx - 1;
+			E.cy = re.old_cy;
+			break;
+
+		case UNDO_JOIN_LINES:
+			/* Redo: re-join the lines (repeat the original backspace at col 0) */
+			{
+				erow *row = &E.row[re.old_cy];
+				ue.str = malloc(row->size);
+				memcpy(ue.str, row->chars, row->size);
+				ue.str_len = row->size;
+
+				E.cx = E.row[re.old_cy - 1].size;
+				editorRowAppendString(&E.row[re.old_cy - 1], row->chars, row->size);
+				editorDeleteRow(re.old_cy);
+				E.cy = re.old_cy - 1;
+			}
+			break;
+
+		case UNDO_INSERT_NEWLINE:
+			/* Redo: re-split the line */
+			if (re.old_cx == 0) {
+				editorInsertRow(re.old_cy, "", 0);
+			} else {
+				erow *row = &E.row[re.old_cy];
+				editorInsertRow(re.old_cy + 1, &row->chars[re.old_cx],
+				               row->size - re.old_cx);
+				row = &E.row[re.old_cy];  /* re-read after realloc */
+				row->size = re.old_cx;
+				row->chars[row->size] = '\0';
+				editorUpdateSyntax(row, re.old_cy);
+			}
+			E.cy = re.old_cy + 1;
+			E.cx = 0;
+			break;
+
+		case UNDO_DUPLICATE_LINE:
+			/* Redo: re-duplicate the line */
+			editorInsertRow(re.old_cy + 1,
+				E.row[re.old_cy].chars, E.row[re.old_cy].size);
+			E.cy = re.old_cy + 1;
+			E.cx = re.old_cx;
+			break;
+	}
+
+	free(re.str);
+	undoStackPush(&undo_stack, ue);
 }
 
 /*
@@ -1220,6 +1536,14 @@ void editorProcessKeypress(void)
 
 		case CTRL_KEY('s'):                 /* Save */
 			editorSave();
+			break;
+
+		case CTRL_KEY('z'):                 /* Undo */
+			editorUndo();
+			break;
+
+		case CTRL_KEY('y'):                 /* Redo */
+			editorRedo();
 			break;
 
 		case CTRL_KEY('f'):                 /* Find/Search */
@@ -1287,7 +1611,7 @@ int main(int argc, char *argv[])
 		editorOpen(argv[1]);
 	}
 
-	editorSetStatusMessage("HELP: Ctrl-S = save | Ctrl-Q = quit | Ctrl-F = find | Ctrl-D = dup line");
+	editorSetStatusMessage("Ctrl-S=save | Ctrl-Q=quit | Ctrl-F=find | Ctrl-Z=undo | Ctrl-Y=redo");
 
 	while (1) {
 		editorRefreshScreen();

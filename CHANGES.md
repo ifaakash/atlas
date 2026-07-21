@@ -21,6 +21,8 @@ make                  # build
 | Ctrl+Q     | Quit (press twice if unsaved)   |
 | Ctrl+F     | Search (arrows = next/prev)     |
 | Ctrl+D     | Duplicate current line          |
+| Ctrl+Z     | Undo                            |
+| Ctrl+Y     | Redo                            |
 | Backspace  | Delete character before cursor  |
 | Delete     | Delete character at cursor      |
 | Enter      | Insert newline / split line     |
@@ -97,9 +99,18 @@ make                  # build
 - ANSI color codes: red=numbers, magenta=strings, cyan=comments, yellow=keywords, green=types
 - Auto-detects filetype from filename extension
 
+### 12. Undo/Redo
+- Ring buffer (circular array) stacks with 1000-entry cap — auto-evicts oldest
+- "Inverse command" pattern: each edit records enough data to reverse itself
+- 5 operation types: INSERT_CHAR, DELETE_CHAR, JOIN_LINES, INSERT_NEWLINE, DUPLICATE_LINE
+- Undo (Ctrl+Z) pops from undo stack, reverses operation, pushes redo entry
+- Redo (Ctrl+Y) pops from redo stack, re-applies operation, pushes undo entry
+- New edit clears redo stack (standard behavior)
+- Cursor position restored on every undo/redo
+
 ## Architecture
 
-Everything lives in `main.c` (~900 lines). Key data structures:
+Everything lives in `main.c` (~1100 lines). Key data structures:
 
 - `erow` — one row: `{size, chars, hl[], hl_open_comment}`
 - `AppendBuffer` — write buffer: `{data, len}` for batch screen writes
