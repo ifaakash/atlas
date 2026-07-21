@@ -127,13 +127,19 @@ void editorScroll(void)
 	if (E.cy >= E.rowoff + E.screenrows)
 		E.rowoff = E.cy - E.screenrows + 1;
 
+	/*
+	 * Horizontal scroll must account for the line number gutter.
+	 * The actual text area is (screencols - line_number_width) wide.
+	 */
+	int content_cols = E.screencols - E.line_number_width;
+
 	/* Cursor moved left of the visible area — scroll left */
 	if (E.cx < E.coloff)
 		E.coloff = E.cx;
 
 	/* Cursor moved right of the visible area — scroll right */
-	if (E.cx >= E.coloff + E.screencols)
-		E.coloff = E.cx - E.screencols + 1;
+	if (E.cx >= E.coloff + content_cols)
+		E.coloff = E.cx - content_cols + 1;
 }
 
 void editorRefreshScreen(void)
