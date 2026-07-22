@@ -28,6 +28,17 @@ void initEditor(void)
 	E.line_number_width = 4;  /* default: 3 digits + 1 space */
 	E.bracket_match_row = -1;
 	E.bracket_match_col = -1;
+	E.last_click_time.tv_sec = 0;
+	E.last_click_time.tv_usec = 0;
+	E.last_click_x = -1;
+	E.last_click_y = -1;
+	E.highlight_word = NULL;
+	E.highlight_word_len = 0;
+	E.multi_active = 0;
+	E.multi_count = 0;
+	E.multi_typed_len = 0;
+	E.multi_original = NULL;
+	E.multi_original_len = 0;
 
 	/* Configuration defaults (overridden by ~/.atlasrc) */
 	E.tab_width = 4;
@@ -56,6 +67,13 @@ void editorProcessKeypress(void)
 	static int quit_times = 1;
 
 	int c = editorReadKey();
+
+	/* Multi-cursor mode intercepts all input */
+	if (E.multi_active) {
+		editorMultiCursorKey(c);
+		quit_times = 1;
+		return;
+	}
 
 	switch (c) {
 		case '\r':                          /* Enter key */
@@ -111,16 +129,43 @@ void editorProcessKeypress(void)
 			editorDeleteLine();
 			break;
 
+		case CTRL_KEY('r'):                 /* Multi-cursor replace */
+			if (E.sel_active && E.highlight_word) {
+				editorMultiCursorStart();
+			} else {
+				editorSetStatusMessage("Select a word first (double-click)");
+			}
+			break;
+
 		case MOUSE_CLICK:                   /* Mouse click — position cursor */
-			editorClearSelection();
-			E.cy = E.mouse_y + E.rowoff;
-			E.cx = (E.mouse_x - E.line_number_width) + E.coloff;
-			if (E.cx < 0) E.cx = 0;  /* clicked in gutter */
-			/* Clamp to file bounds */
-			if (E.cy >= E.numrows)
-				E.cy = E.numrows ? E.numrows - 1 : 0;
-			if (E.cy < E.numrows && E.cx > E.row[E.cy].size)
-				E.cx = E.row[E.cy].size;
+			{
+				struct timeval now;
+				gettimeofday(&now, NULL);
+				long ms = (now.tv_sec - E.last_click_time.tv_sec) * 1000 +
+				          (now.tv_usec - E.last_click_time.tv_usec) / 1000;
+
+				int click_x = E.mouse_x;
+				int click_y = E.mouse_y;
+
+				editorClearSelection();
+				E.cy = click_y + E.rowoff;
+				E.cx = (click_x - E.line_number_width) + E.coloff;
+				if (E.cx < 0) E.cx = 0;
+				if (E.cy >= E.numrows)
+					E.cy = E.numrows ? E.numrows - 1 : 0;
+				if (E.cy < E.numrows && E.cx > E.row[E.cy].size)
+					E.cx = E.row[E.cy].size;
+
+				/* Double-click: same position within 400ms → select word */
+				if (ms > 0 && ms < 400 &&
+				    click_x == E.last_click_x && click_y == E.last_click_y) {
+					editorSelectWord();
+				}
+
+				E.last_click_time = now;
+				E.last_click_x = click_x;
+				E.last_click_y = click_y;
+			}
 			break;
 
 		case SHIFT_UP:                      /* Shift+Arrow — extend selection */

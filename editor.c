@@ -567,6 +567,220 @@ int editorFindMatchingBracket(int row, int col, int *match_row, int *match_col)
 	return 1;
 }
 
+/* --- Multi-Cursor Replace --- */
+
+/*
+ * Recalculate multi-cursor column positions after typing.
+ * Each cursor on the same row as an earlier cursor shifts by multi_typed_len
+ * per earlier same-row cursor (since those cursors inserted text before it).
+ */
+static void editorMultiCursorRecalcCols(void)
+{
+	int i, j;
+	for (i = 0; i < E.multi_count; i++) {
+		int same_row_before = 0;
+		for (j = 0; j < i; j++) {
+			if (E.multi_cursors[j].row == E.multi_cursors[i].row)
+				same_row_before++;
+		}
+		E.multi_cursors[i].col = E.multi_cursors[i].base_col +
+		                          same_row_before * E.multi_typed_len;
+	}
+}
+
+/*
+ * Enter multi-cursor mode: find all occurrences of the selected word,
+ * delete the original word at each position, place cursors.
+ */
+void editorMultiCursorStart(void)
+{
+	if (!E.highlight_word || E.highlight_word_len == 0) return;
+
+	/* Save the original word */
+	E.multi_original = strdup(E.highlight_word);
+	E.multi_original_len = E.highlight_word_len;
+	E.multi_typed_len = 0;
+
+	/* Find ALL whole-word occurrences in the file */
+	E.multi_count = 0;
+	int r;
+	for (r = 0; r < E.numrows && E.multi_count < MAX_MULTI_CURSORS; r++) {
+		erow *row = &E.row[r];
+		int c = 0;
+		while (c + E.multi_original_len <= row->size) {
+			if (strncmp(&row->chars[c], E.multi_original, E.multi_original_len) == 0) {
+				int left_ok = (c == 0 || is_separator(row->chars[c - 1]));
+				int right_ok = (c + E.multi_original_len >= row->size ||
+				               is_separator(row->chars[c + E.multi_original_len]));
+				if (left_ok && right_ok) {
+					E.multi_cursors[E.multi_count].row = r;
+					E.multi_cursors[E.multi_count].col = c;
+					E.multi_count++;
+					c += E.multi_original_len;
+					continue;
+				}
+			}
+			c++;
+		}
+	}
+
+	if (E.multi_count == 0) {
+		free(E.multi_original);
+		E.multi_original = NULL;
+		editorSetStatusMessage("No occurrences found");
+		return;
+	}
+
+	/* Delete the original word at each position (end to start) */
+	int i;
+	for (i = E.multi_count - 1; i >= 0; i--) {
+		editorRowDeleteChars(&E.row[E.multi_cursors[i].row],
+		                     E.multi_cursors[i].col,
+		                     E.multi_original_len);
+	}
+
+	/* Adjust cursor columns for same-row deletions:
+	 * each earlier cursor on the same row shifted this one left by original_len */
+	for (i = 1; i < E.multi_count; i++) {
+		int earlier = 0;
+		int j;
+		for (j = 0; j < i; j++) {
+			if (E.multi_cursors[j].row == E.multi_cursors[i].row)
+				earlier++;
+		}
+		E.multi_cursors[i].col -= earlier * E.multi_original_len;
+	}
+
+	/* Store base columns */
+	for (i = 0; i < E.multi_count; i++)
+		E.multi_cursors[i].base_col = E.multi_cursors[i].col;
+
+	/* Clear selection, enter multi-cursor mode */
+	editorClearSelection();
+	E.multi_active = 1;
+	E.cx = E.multi_cursors[0].col;
+	E.cy = E.multi_cursors[0].row;
+
+	editorSetStatusMessage("Multi-edit: %d cursors | Type replacement | Enter=done | Esc=cancel",
+	                       E.multi_count);
+}
+
+/*
+ * Confirm multi-cursor replace: push undo entry and exit.
+ */
+static void editorMultiCursorConfirm(void)
+{
+	/* Build undo entry: str = "original\0replacement" */
+	UndoEntry ue = {0};
+	ue.type = UNDO_MULTI_REPLACE;
+	ue.old_cx = E.cx;
+	ue.old_cy = E.cy;
+	ue.c = E.multi_original_len;
+	ue.indent = E.multi_typed_len;
+
+	int total = E.multi_original_len + 1 + E.multi_typed_len;
+	ue.str = malloc(total);
+	memcpy(ue.str, E.multi_original, E.multi_original_len);
+	ue.str[E.multi_original_len] = '\0';
+	if (E.multi_typed_len > 0) {
+		/* Extract replacement text from first cursor position */
+		memcpy(ue.str + E.multi_original_len + 1,
+		       &E.row[E.multi_cursors[0].row].chars[E.multi_cursors[0].col],
+		       E.multi_typed_len);
+	}
+	ue.str_len = total;
+
+	undoStackPush(&undo_stack, ue);
+	undoStackClear(&redo_stack);
+
+	editorSetStatusMessage("Replaced %d occurrences", E.multi_count);
+
+	free(E.multi_original);
+	E.multi_original = NULL;
+	E.multi_active = 0;
+	E.multi_count = 0;
+	E.dirty++;
+}
+
+/*
+ * Cancel multi-cursor replace: delete typed text, re-insert original word.
+ */
+static void editorMultiCursorCancel(void)
+{
+	int i;
+
+	/* Remove typed text at each cursor (end to start) */
+	if (E.multi_typed_len > 0) {
+		for (i = E.multi_count - 1; i >= 0; i--) {
+			editorRowDeleteChars(&E.row[E.multi_cursors[i].row],
+			                     E.multi_cursors[i].col, E.multi_typed_len);
+		}
+	}
+
+	/* Re-insert original word at each cursor (end to start) */
+	for (i = E.multi_count - 1; i >= 0; i--) {
+		editorRowInsertString(&E.row[E.multi_cursors[i].row],
+		                      E.multi_cursors[i].base_col,
+		                      E.multi_original, E.multi_original_len);
+	}
+
+	editorSetStatusMessage("Multi-edit cancelled");
+
+	free(E.multi_original);
+	E.multi_original = NULL;
+	E.multi_active = 0;
+	E.multi_count = 0;
+}
+
+/*
+ * Handle keypress in multi-cursor mode.
+ * Only printable chars, backspace, Enter (confirm), and Escape (cancel).
+ */
+void editorMultiCursorKey(int c)
+{
+	if (c == '\r') {
+		editorMultiCursorConfirm();
+		return;
+	}
+
+	if (c == '\x1b') {
+		editorMultiCursorCancel();
+		return;
+	}
+
+	if (c == BACKSPACE || c == CTRL_KEY('h')) {
+		if (E.multi_typed_len == 0) return;
+
+		/* Delete one char at each cursor position (end to start) */
+		int i;
+		for (i = E.multi_count - 1; i >= 0; i--) {
+			int col = E.multi_cursors[i].col + E.multi_typed_len - 1;
+			editorRowDeleteChar(&E.row[E.multi_cursors[i].row], col);
+		}
+		E.multi_typed_len--;
+		editorMultiCursorRecalcCols();
+		E.cx = E.multi_cursors[0].col + E.multi_typed_len;
+		E.cy = E.multi_cursors[0].row;
+		return;
+	}
+
+	/* Printable character: insert at ALL cursor positions (end to start) */
+	if (c >= 32 && c < 127) {
+		int i;
+		for (i = E.multi_count - 1; i >= 0; i--) {
+			int col = E.multi_cursors[i].col + E.multi_typed_len;
+			editorRowInsertChar(&E.row[E.multi_cursors[i].row], col, c);
+		}
+		E.multi_typed_len++;
+		editorMultiCursorRecalcCols();
+		E.cx = E.multi_cursors[0].col + E.multi_typed_len;
+		E.cy = E.multi_cursors[0].row;
+		return;
+	}
+
+	/* Ignore all other keys in multi-cursor mode */
+}
+
 /* --- Undo/Redo --- */
 
 /*
@@ -682,6 +896,44 @@ void editorUndo(void)
 			re.str_len = ue.str_len;
 			E.cx = ue.old_cx;
 			E.cy = ue.old_cy;
+			break;
+
+		case UNDO_MULTI_REPLACE:
+			/* Undo: find all replacement words, replace with original.
+			 * str = "original\0replacement", c = orig_len, indent = rep_len */
+			{
+				char *orig = ue.str;
+				int orig_len = ue.c;
+				char *rep = ue.str + orig_len + 1;
+				int rep_len = ue.indent;
+
+				/* Save redo data */
+				re.str = malloc(ue.str_len);
+				memcpy(re.str, ue.str, ue.str_len);
+				re.str_len = ue.str_len;
+				re.c = ue.c;
+				re.indent = ue.indent;
+
+				/* Scan file for replacement, replace with original (end to start) */
+				int r;
+				for (r = E.numrows - 1; r >= 0; r--) {
+					int pos = E.row[r].size - rep_len;
+					while (pos >= 0) {
+						if (strncmp(&E.row[r].chars[pos], rep, rep_len) == 0) {
+							int left_ok = (pos == 0 || is_separator(E.row[r].chars[pos - 1]));
+							int right_ok = (pos + rep_len >= E.row[r].size ||
+							               is_separator(E.row[r].chars[pos + rep_len]));
+							if (left_ok && right_ok) {
+								editorRowDeleteChars(&E.row[r], pos, rep_len);
+								editorRowInsertString(&E.row[r], pos, orig, orig_len);
+							}
+						}
+						pos--;
+					}
+				}
+				E.cx = ue.old_cx;
+				E.cy = ue.old_cy;
+			}
 			break;
 	}
 
@@ -801,6 +1053,43 @@ void editorRedo(void)
 			editorRowInsertString(&E.row[re.old_cy], re.old_cx, re.str, re.str_len);
 			E.cx = re.old_cx + re.str_len;
 			E.cy = re.old_cy;
+			break;
+
+		case UNDO_MULTI_REPLACE:
+			/* Redo: find all original words, replace with replacement */
+			{
+				char *orig = re.str;
+				int orig_len = re.c;
+				char *rep = re.str + orig_len + 1;
+				int rep_len = re.indent;
+
+				/* Save undo data */
+				ue.str = malloc(re.str_len);
+				memcpy(ue.str, re.str, re.str_len);
+				ue.str_len = re.str_len;
+				ue.c = re.c;
+				ue.indent = re.indent;
+
+				/* Scan file for original, replace with replacement (end to start) */
+				int r;
+				for (r = E.numrows - 1; r >= 0; r--) {
+					int pos = E.row[r].size - orig_len;
+					while (pos >= 0) {
+						if (strncmp(&E.row[r].chars[pos], orig, orig_len) == 0) {
+							int left_ok = (pos == 0 || is_separator(E.row[r].chars[pos - 1]));
+							int right_ok = (pos + orig_len >= E.row[r].size ||
+							               is_separator(E.row[r].chars[pos + orig_len]));
+							if (left_ok && right_ok) {
+								editorRowDeleteChars(&E.row[r], pos, orig_len);
+								editorRowInsertString(&E.row[r], pos, rep, rep_len);
+							}
+						}
+						pos--;
+					}
+				}
+				E.cx = re.old_cx;
+				E.cy = re.old_cy;
+			}
 			break;
 	}
 

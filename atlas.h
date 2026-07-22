@@ -14,6 +14,7 @@
 #include <fcntl.h>     /* open, O_RDWR, O_CREAT, O_TRUNC */
 #include <errno.h>     /* errno, for error messages on save failure */
 #include <ctype.h>     /* iscntrl — check if a character is a control character */
+#include <sys/time.h>  /* struct timeval, gettimeofday — for double-click timing */
 
 /* Ctrl key strips bits 5-7, leaving only bits 0-4. So Ctrl+Q = 'q' & 0x1f = 17 */
 #define CTRL_KEY(k) ((k) & 0x1f)
@@ -23,6 +24,7 @@
 #define HL_HIGHLIGHT_STRINGS (1<<1)
 
 #define UNDO_MAX 1000
+#define MAX_MULTI_CURSORS 256
 
 /* --- Syntax highlighting types --- */
 
@@ -68,6 +70,12 @@ typedef struct {
 	int hl_open_comment;    /* does this row end inside an unclosed multi-line comment? */
 } erow;
 
+/* Multi-cursor position — used for multi-occurrence editing */
+typedef struct {
+	int row, col;
+	int base_col;  /* column after initial word deletion, before replacement typing */
+} MultiCursor;
+
 /* All editor state lives here — one struct, easy to find, easy to refactor later */
 struct EditorConfig {
 	int cx, cy;         /* cursor position (column, row) — in FILE coordinates */
@@ -91,6 +99,22 @@ struct EditorConfig {
 	int line_number_width;       /* width of line number gutter (digits + 1 space) */
 	int bracket_match_row;       /* row of matching bracket, -1 if none */
 	int bracket_match_col;       /* col of matching bracket */
+
+	/* Double-click detection */
+	struct timeval last_click_time;
+	int last_click_x, last_click_y;
+
+	/* Occurrence highlighting */
+	char *highlight_word;
+	int highlight_word_len;
+
+	/* Multi-cursor replace */
+	int multi_active;
+	MultiCursor multi_cursors[MAX_MULTI_CURSORS];
+	int multi_count;
+	int multi_typed_len;
+	char *multi_original;
+	int multi_original_len;
 
 	/* Configuration (loaded from ~/.atlasrc) */
 	int tab_width;
@@ -119,7 +143,8 @@ enum UndoType {
 	UNDO_INSERT_NEWLINE,  /* Enter split a line or inserted blank line */
 	UNDO_DUPLICATE_LINE,  /* Ctrl+D duplicated a line */
 	UNDO_DELETE_LINE,     /* Ctrl+K deleted an entire line */
-	UNDO_INSERT_STRING    /* grouped character inserts (word-level undo) */
+	UNDO_INSERT_STRING,   /* grouped character inserts (word-level undo) */
+	UNDO_MULTI_REPLACE    /* multi-cursor find-and-replace */
 };
 
 /*
@@ -232,6 +257,8 @@ void editorDeleteWord(void);
 void editorAutoComplete(void);
 void editorDeleteLine(void);
 int editorFindMatchingBracket(int row, int col, int *match_row, int *match_col);
+void editorMultiCursorStart(void);
+void editorMultiCursorKey(int c);
 void editorUndo(void);
 void editorRedo(void);
 
@@ -257,6 +284,7 @@ void editorClearSelection(void);
 int isSelected(int row, int col);
 void editorCopySelection(void);
 void editorPasteClipboard(void);
+void editorSelectWord(void);
 
 /* config.c */
 void editorLoadConfig(void);

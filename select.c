@@ -83,6 +83,31 @@ void editorCopySelection(void)
 	E.clipboard_len = ab.len;
 }
 
+/* Select the word under the cursor (used on double-click) */
+void editorSelectWord(void)
+{
+	if (E.cy >= E.numrows) return;
+	erow *row = &E.row[E.cy];
+	if (E.cx >= row->size) return;
+	if (is_separator(row->chars[E.cx])) return;
+
+	/* Scan left to find word start */
+	int start = E.cx;
+	while (start > 0 && !is_separator(row->chars[start - 1]))
+		start--;
+
+	/* Scan right to find word end */
+	int end = E.cx;
+	while (end < row->size && !is_separator(row->chars[end]))
+		end++;
+
+	/* Set selection: anchor at start, cursor at end */
+	E.sel_active = 1;
+	E.sel_anchor_x = start;
+	E.sel_anchor_y = E.cy;
+	E.cx = end;
+}
+
 /* Paste clipboard content at cursor position */
 void editorPasteClipboard(void)
 {

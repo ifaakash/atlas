@@ -1,5 +1,57 @@
 #include "atlas.h"
 
+/*
+ * Check if position (filerow, col_idx) is part of a non-selected
+ * occurrence of E.highlight_word. Returns 1 if should be highlighted.
+ */
+static int isOccurrenceHighlight(int filerow, int col_idx)
+{
+	if (!E.highlight_word || E.highlight_word_len == 0) return 0;
+	if (filerow >= E.numrows) return 0;
+
+	erow *row = &E.row[filerow];
+	int wlen = E.highlight_word_len;
+
+	/* Check each possible start position that could include col_idx */
+	int check_start = col_idx - wlen + 1;
+	if (check_start < 0) check_start = 0;
+
+	int s;
+	for (s = check_start; s <= col_idx; s++) {
+		if (s + wlen > row->size) continue;
+		if (strncmp(&row->chars[s], E.highlight_word, wlen) != 0) continue;
+
+		/* Check word boundaries */
+		int left_ok = (s == 0 || is_separator(row->chars[s - 1]));
+		int right_ok = (s + wlen >= row->size || is_separator(row->chars[s + wlen]));
+		if (!left_ok || !right_ok) continue;
+
+		/* Skip if this IS the selected instance */
+		if (E.sel_active && E.sel_anchor_y == E.cy) {
+			int sel_start = E.sel_anchor_x < E.cx ? E.sel_anchor_x : E.cx;
+			if (filerow == E.sel_anchor_y && s == sel_start) continue;
+		}
+
+		return 1;
+	}
+	return 0;
+}
+
+/*
+ * Check if position matches any multi-cursor insertion point.
+ */
+static int isMultiCursorPos(int filerow, int col_idx)
+{
+	if (!E.multi_active) return 0;
+	int i;
+	for (i = 0; i < E.multi_count; i++) {
+		if (E.multi_cursors[i].row == filerow &&
+		    col_idx == E.multi_cursors[i].col + E.multi_typed_len)
+			return 1;
+	}
+	return 0;
+}
+
 void abAppend(struct AppendBuffer *ab, const char *s, int len){
     ab->data = realloc(ab->data, ab->len + len);
     memcpy(ab->data + ab->len, s, len);
@@ -182,6 +234,31 @@ void editorRefreshScreen(void)
 	editorUpdateLineNumberWidth();
 	int content_cols = E.screencols - E.line_number_width;
 
+	/* Update occurrence highlight word from selection */
+	free(E.highlight_word);
+	E.highlight_word = NULL;
+	E.highlight_word_len = 0;
+	if (E.sel_active && E.sel_anchor_y == E.cy && E.cy < E.numrows) {
+		int start = E.sel_anchor_x < E.cx ? E.sel_anchor_x : E.cx;
+		int end = E.sel_anchor_x < E.cx ? E.cx : E.sel_anchor_x;
+		int wlen = end - start;
+		if (wlen > 0 && end <= E.row[E.cy].size) {
+			int left_ok = (start == 0 || is_separator(E.row[E.cy].chars[start - 1]));
+			int right_ok = (end >= E.row[E.cy].size || is_separator(E.row[E.cy].chars[end]));
+			int has_sep = 0;
+			int i;
+			for (i = start; i < end; i++) {
+				if (is_separator(E.row[E.cy].chars[i])) { has_sep = 1; break; }
+			}
+			if (left_ok && right_ok && !has_sep) {
+				E.highlight_word = malloc(wlen + 1);
+				memcpy(E.highlight_word, &E.row[E.cy].chars[start], wlen);
+				E.highlight_word[wlen] = '\0';
+				E.highlight_word_len = wlen;
+			}
+		}
+	}
+
 	/* Compute bracket match before drawing */
 	E.bracket_match_row = -1;
 	E.bracket_match_col = -1;
@@ -246,6 +323,19 @@ void editorRefreshScreen(void)
 						current_color = -1;
 					}
 
+					/* Occurrence highlight (subtle gray bg for matching words) */
+					int is_occurrence = (!sel && isOccurrenceHighlight(filerow, col_idx));
+					if (is_occurrence && !in_sel) {
+						abAppend(&ab, "\x1b[48;5;239m", 10);  /* subtle gray bg */
+						current_color = -1;
+					}
+
+					/* Multi-cursor indicator (underline at cursor positions) */
+					int is_multi = isMultiCursorPos(filerow, col_idx);
+					if (is_multi) {
+						abAppend(&ab, "\x1b[4m", 4);  /* underline on */
+					}
+
 					/* Bracket match highlight */
 					int is_bracket_match =
 						(filerow == E.bracket_match_row &&
@@ -266,6 +356,18 @@ void editorRefreshScreen(void)
 						abAppend(&ab, colbuf, clen);
 					}
 					abAppend(&ab, &c[j], 1);
+
+					if (is_multi) {
+						abAppend(&ab, "\x1b[24m", 5);  /* underline off */
+					}
+
+					if (is_occurrence && !in_sel) {
+						if (is_current_line)
+							abAppend(&ab, "\x1b[48;5;237m", 11);
+						else
+							abAppend(&ab, "\x1b[49m", 5);
+						current_color = -1;
+					}
 
 					if (is_bracket_match) {
 						if (in_sel)
