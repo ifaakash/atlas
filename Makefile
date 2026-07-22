@@ -4,7 +4,7 @@
 CC = gcc
 CFLAGS = -std=c11 -Wall -Wextra -g
 
-SRCS = main.c terminal.c buffer.c display.c editor.c file.c search.c syntax.c select.c
+SRCS = main.c terminal.c buffer.c display.c editor.c file.c search.c syntax.c select.c config.c
 OBJS = $(SRCS:.c=.o)
 
 all: atlas

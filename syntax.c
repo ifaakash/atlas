@@ -13,6 +13,68 @@ char *C_HL_keywords[] = {
 	"void|", "size_t|", "ssize_t|", "FILE|", NULL
 };
 
+/* --- Python --- */
+
+char *Python_HL_extensions[] = { ".py", ".pyw", NULL };
+
+char *Python_HL_keywords[] = {
+	"and", "as", "assert", "async", "await", "break", "class", "continue",
+	"def", "del", "elif", "else", "except", "finally", "for", "from",
+	"global", "if", "import", "in", "is", "lambda", "nonlocal", "not",
+	"or", "pass", "raise", "return", "try", "while", "with", "yield",
+	/* Type keywords */
+	"True|", "False|", "None|", "int|", "str|", "float|", "bool|",
+	"list|", "dict|", "tuple|", "set|", "bytes|", "type|", "object|",
+	"self|", NULL
+};
+
+/* --- Shell (Bash/Zsh) --- */
+
+char *Shell_HL_extensions[] = { ".sh", ".bash", ".zsh", NULL };
+
+char *Shell_HL_keywords[] = {
+	"if", "then", "else", "elif", "fi", "for", "while", "do", "done",
+	"case", "esac", "in", "function", "return", "local", "export",
+	"source", "alias", "unalias", "set", "unset", "shift", "break",
+	"continue", "exit", "trap", "readonly", "declare", "select", "until",
+	/* Built-in commands */
+	"echo|", "printf|", "cd|", "ls|", "grep|", "awk|", "sed|",
+	"cat|", "mkdir|", "rm|", "cp|", "mv|", "chmod|", "chown|",
+	"curl|", "wget|", NULL
+};
+
+/* --- YAML --- */
+
+char *YAML_HL_extensions[] = { ".yml", ".yaml", NULL };
+
+char *YAML_HL_keywords[] = {
+	"true|", "false|", "null|", "yes|", "no|", "on|", "off|", NULL
+};
+
+/* --- Terraform (HCL) --- */
+
+char *Terraform_HL_extensions[] = { ".tf", ".tfvars", NULL };
+
+char *Terraform_HL_keywords[] = {
+	"resource", "variable", "output", "data", "module", "provider",
+	"locals", "terraform", "backend", "required_providers",
+	"required_version", "provisioner", "lifecycle", "depends_on",
+	"count", "for_each", "dynamic", "content", "source", "version",
+	"moved", "import", "check",
+	/* Types */
+	"string|", "number|", "bool|", "list|", "map|", "object|",
+	"set|", "tuple|", "any|", "true|", "false|", "null|", NULL
+};
+
+/* --- Markdown --- */
+
+char *Markdown_HL_extensions[] = { ".md", ".markdown", ".mkd", NULL };
+
+char *Markdown_HL_keywords[] = {
+	"####", "###", "##", "#",
+	"TODO", "FIXME", "NOTE", "HACK", NULL
+};
+
 /* HLDB: the highlight database. Add new languages here. */
 struct editorSyntax HLDB[] = {
 	{
@@ -21,6 +83,41 @@ struct editorSyntax HLDB[] = {
 		C_HL_keywords,
 		"//", "/*", "*/",
 		HL_HIGHLIGHT_NUMBERS | HL_HIGHLIGHT_STRINGS
+	},
+	{
+		"python",
+		Python_HL_extensions,
+		Python_HL_keywords,
+		"#", NULL, NULL,
+		HL_HIGHLIGHT_NUMBERS | HL_HIGHLIGHT_STRINGS
+	},
+	{
+		"shell",
+		Shell_HL_extensions,
+		Shell_HL_keywords,
+		"#", NULL, NULL,
+		HL_HIGHLIGHT_NUMBERS | HL_HIGHLIGHT_STRINGS
+	},
+	{
+		"yaml",
+		YAML_HL_extensions,
+		YAML_HL_keywords,
+		"#", NULL, NULL,
+		HL_HIGHLIGHT_NUMBERS | HL_HIGHLIGHT_STRINGS
+	},
+	{
+		"terraform",
+		Terraform_HL_extensions,
+		Terraform_HL_keywords,
+		"#", "/*", "*/",
+		HL_HIGHLIGHT_NUMBERS | HL_HIGHLIGHT_STRINGS
+	},
+	{
+		"markdown",
+		Markdown_HL_extensions,
+		Markdown_HL_keywords,
+		NULL, NULL, NULL,
+		HL_HIGHLIGHT_STRINGS
 	},
 };
 
@@ -48,8 +145,9 @@ int editorSyntaxToColor(int hl)
 		case HL_COMMENT:
 		case HL_MLCOMMENT:  return 243;  /* gray */
 		case HL_KEYWORD1:   return 170;  /* purple */
-		case HL_KEYWORD2:   return 75;   /* blue */
-		default:            return 252;  /* light gray */
+		case HL_KEYWORD2:       return 75;   /* blue */
+		case HL_BRACKET_MATCH:  return 226;  /* bright yellow */
+		default:                return 252;  /* light gray */
 	}
 }
 
@@ -69,7 +167,7 @@ void editorUpdateSyntax(erow *row, int row_index)
 	row->hl = realloc(row->hl, row->size);
 	memset(row->hl, HL_NORMAL, row->size);
 
-	if (E.syntax == NULL) return;
+	if (!E.syntax_on || E.syntax == NULL) return;
 
 	char **keywords = E.syntax->keywords;
 	char *scs = E.syntax->singleline_comment_start;

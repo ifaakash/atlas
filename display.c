@@ -16,6 +16,10 @@ void abFree(struct AppendBuffer *ab){
 
 void editorUpdateLineNumberWidth(void)
 {
+	if (!E.show_line_numbers) {
+		E.line_number_width = 0;
+		return;
+	}
 	int digits = 1;
 	int n = E.numrows;
 	while (n >= 10) { n /= 10; digits++; }
@@ -131,6 +135,7 @@ static void editorDrawWelcomeScreen(struct AppendBuffer *ab)
 		"\x1b[38;5;252m   Ctrl+G  \x1b[38;5;243mgo to line",
 		"\x1b[38;5;252m   Ctrl+Z  \x1b[38;5;243mundo",
 		"\x1b[38;5;252m   Ctrl+D  \x1b[38;5;243mduplicate line",
+		"\x1b[38;5;252m   Ctrl+K  \x1b[38;5;243mdelete line",
 		"\x1b[38;5;252m   Ctrl+W  \x1b[38;5;243mdelete word",
 		"\x1b[38;5;252m   Tab     \x1b[38;5;243mauto-complete",
 		"",
@@ -177,6 +182,14 @@ void editorRefreshScreen(void)
 	editorUpdateLineNumberWidth();
 	int content_cols = E.screencols - E.line_number_width;
 
+	/* Compute bracket match before drawing */
+	E.bracket_match_row = -1;
+	E.bracket_match_col = -1;
+	if (E.cy < E.numrows && E.cx < E.row[E.cy].size) {
+		editorFindMatchingBracket(E.cy, E.cx,
+			&E.bracket_match_row, &E.bracket_match_col);
+	}
+
 	/* Welcome screen when no file is loaded */
 	if (E.numrows == 0 && E.filename == NULL) {
 		editorDrawWelcomeScreen(&ab);
@@ -193,15 +206,17 @@ void editorRefreshScreen(void)
 					abAppend(&ab, "\x1b[48;5;237m", 11);
 
 				/* Line number */
-				char linenum[16];
-				int lnlen = snprintf(linenum, sizeof(linenum), "%*d ",
-				                     E.line_number_width - 1, filerow + 1);
-				if (is_current_line)
-					abAppend(&ab, "\x1b[38;5;255m", 11);  /* bright white for current line */
-				else
-					abAppend(&ab, "\x1b[38;5;240m", 11);  /* dim gray for other lines */
-				abAppend(&ab, linenum, lnlen);
-				abAppend(&ab, "\x1b[39m", 5);  /* reset fg */
+				if (E.show_line_numbers) {
+					char linenum[16];
+					int lnlen = snprintf(linenum, sizeof(linenum), "%*d ",
+					                     E.line_number_width - 1, filerow + 1);
+					if (is_current_line)
+						abAppend(&ab, "\x1b[38;5;255m", 11);  /* bright white for current line */
+					else
+						abAppend(&ab, "\x1b[38;5;240m", 11);  /* dim gray for other lines */
+					abAppend(&ab, linenum, lnlen);
+					abAppend(&ab, "\x1b[39m", 5);  /* reset fg */
+				}
 
 				/* File content with syntax colors */
 				int len = E.row[filerow].size - E.coloff;
@@ -231,8 +246,19 @@ void editorRefreshScreen(void)
 						current_color = -1;
 					}
 
+					/* Bracket match highlight */
+					int is_bracket_match =
+						(filerow == E.bracket_match_row &&
+						 col_idx == E.bracket_match_col);
+
+					if (is_bracket_match) {
+						abAppend(&ab, "\x1b[48;5;58m", 10);  /* dark yellow bg */
+						abAppend(&ab, "\x1b[38;5;226m", 11); /* bright yellow fg */
+						current_color = -1;
+					}
+
 					int color = editorSyntaxToColor(hl[j]);
-					if (color != current_color) {
+					if (!is_bracket_match && color != current_color) {
 						current_color = color;
 						char colbuf[16];
 						int clen = snprintf(colbuf, sizeof(colbuf),
@@ -240,6 +266,16 @@ void editorRefreshScreen(void)
 						abAppend(&ab, colbuf, clen);
 					}
 					abAppend(&ab, &c[j], 1);
+
+					if (is_bracket_match) {
+						if (in_sel)
+							abAppend(&ab, "\x1b[48;5;24m", 10);
+						else if (is_current_line)
+							abAppend(&ab, "\x1b[48;5;237m", 11);
+						else
+							abAppend(&ab, "\x1b[49m", 5);
+						current_color = -1;
+					}
 				}
 				if (in_sel) abAppend(&ab, "\x1b[49m", 5);
 

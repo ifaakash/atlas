@@ -7,6 +7,14 @@ UndoStack redo_stack;
 
 /* --- Undo stack operations --- */
 
+/* Peek at the top entry without popping. Returns NULL if empty. */
+UndoEntry *undoStackPeek(UndoStack *s)
+{
+	if (s->count == 0) return NULL;
+	int idx = (s->start + s->count - 1) % UNDO_MAX;
+	return &s->entries[idx];
+}
+
 void undoStackInit(UndoStack *s)
 {
 	s->start = 0;
@@ -59,18 +67,46 @@ void undoStackClear(UndoStack *s)
 
 /* --- Editor-level operations (work on cursor position) --- */
 
-/* Insert a character at the current cursor position */
+/* Insert a character at the current cursor position.
+ * Uses word-boundary undo grouping: consecutive non-separator chars
+ * accumulate into a single UNDO_INSERT_STRING entry.
+ * Separators (space, punctuation) each get their own entry. */
 void editorInsertChar(int c)
 {
-	/* Record undo BEFORE making the change */
-	UndoEntry ue = {0};
-	ue.type = UNDO_INSERT_CHAR;
-	ue.old_cx = E.cx;
-	ue.old_cy = E.cy;
-	ue.c = c;
-	undoStackPush(&undo_stack, ue);
-	undoStackClear(&redo_stack);  /* new edit kills redo history */
+	int sep = is_separator(c);
 
+	/* Try to append to the current undo group if:
+	 * - char is NOT a separator
+	 * - top of undo stack is UNDO_INSERT_STRING on the same row
+	 * - cursor is right after the grouped text (contiguous typing) */
+	if (!sep) {
+		UndoEntry *top = undoStackPeek(&undo_stack);
+		if (top && top->type == UNDO_INSERT_STRING &&
+		    top->old_cy == E.cy &&
+		    (top->old_cx + top->str_len) == E.cx) {
+			/* Extend the existing group */
+			top->str = realloc(top->str, top->str_len + 1);
+			top->str[top->str_len] = (char)c;
+			top->str_len++;
+			/* Don't clear redo — already cleared when group started */
+			goto do_insert;
+		}
+	}
+
+	/* Start a new undo entry (new group or separator) */
+	{
+		UndoEntry ue = {0};
+		ue.type = UNDO_INSERT_STRING;
+		ue.old_cx = E.cx;
+		ue.old_cy = E.cy;
+		ue.str = malloc(1);
+		ue.str[0] = (char)c;
+		ue.str_len = 1;
+		undoStackPush(&undo_stack, ue);
+		undoStackClear(&redo_stack);
+	}
+
+do_insert:
 	/* If cursor is at the very end of the file, add a new empty row first */
 	if (E.cy == E.numrows)
 		editorInsertRow(E.numrows, "", 0);
@@ -148,16 +184,20 @@ void editorInsertNewline(void)
 	 * Auto-indent: copy leading whitespace from the previous line.
 	 * We count the indent BEFORE inserting so undo knows how many chars to strip.
 	 */
-	erow *prev = &E.row[E.cy - 1];
 	int indent = 0;
-	while (indent < prev->size && (prev->chars[indent] == ' ' || prev->chars[indent] == '\t'))
-		indent++;
+	if (E.auto_indent) {
+		erow *prev = &E.row[E.cy - 1];
+		while (indent < prev->size && (prev->chars[indent] == ' ' || prev->chars[indent] == '\t'))
+			indent++;
 
-	if (indent > 0) {
-		int i;
-		for (i = 0; i < indent; i++)
-			editorRowInsertChar(&E.row[E.cy], i, prev->chars[i]);
-		E.cx = indent;
+		if (indent > 0) {
+			int i;
+			for (i = 0; i < indent; i++)
+				editorRowInsertChar(&E.row[E.cy], i, prev->chars[i]);
+			E.cx = indent;
+		} else {
+			E.cx = 0;
+		}
 	} else {
 		E.cx = 0;
 	}
@@ -187,6 +227,39 @@ void editorDuplicateLine(void)
 	editorInsertRow(E.cy + 1, row->chars, row->size);
 	E.cy++;  /* move to the duplicated line */
 	editorSetStatusMessage("Line duplicated");
+}
+
+/*
+ * Delete the entire current line (Ctrl+K).
+ * Saves the full line content for undo.
+ */
+void editorDeleteLine(void)
+{
+	if (E.numrows == 0) return;
+	if (E.cy >= E.numrows) return;
+
+	UndoEntry ue = {0};
+	ue.type = UNDO_DELETE_LINE;
+	ue.old_cx = E.cx;
+	ue.old_cy = E.cy;
+
+	/* Save the line content for undo restoration */
+	erow *row = &E.row[E.cy];
+	ue.str = malloc(row->size);
+	memcpy(ue.str, row->chars, row->size);
+	ue.str_len = row->size;
+	undoStackPush(&undo_stack, ue);
+	undoStackClear(&redo_stack);
+
+	editorDeleteRow(E.cy);
+
+	/* Clamp cursor to valid position */
+	if (E.cy >= E.numrows && E.numrows > 0)
+		E.cy = E.numrows - 1;
+	if (E.numrows > 0 && E.cx > E.row[E.cy].size)
+		E.cx = E.row[E.cy].size;
+
+	editorSetStatusMessage("Line deleted");
 }
 
 /*
@@ -433,6 +506,67 @@ void editorAutoComplete(void)
 	}
 }
 
+/* --- Bracket Matching --- */
+
+/*
+ * Find the matching bracket for the character at (row, col).
+ * Returns 1 if found (fills match_row/match_col), 0 if not.
+ * Skips characters inside strings and comments.
+ * Caps scan at 1000 lines for performance.
+ */
+int editorFindMatchingBracket(int row, int col, int *match_row, int *match_col)
+{
+	if (row >= E.numrows || col >= E.row[row].size) return 0;
+
+	char ch = E.row[row].chars[col];
+	char target;
+	int direction;
+
+	switch (ch) {
+		case '(': target = ')'; direction = 1; break;
+		case ')': target = '('; direction = -1; break;
+		case '{': target = '}'; direction = 1; break;
+		case '}': target = '{'; direction = -1; break;
+		case '[': target = ']'; direction = 1; break;
+		case ']': target = '['; direction = -1; break;
+		default: return 0;
+	}
+
+	int depth = 1;
+	int r = row, c = col;
+	int max_lines = 1000;
+
+	while (depth > 0) {
+		/* Advance position */
+		c += direction;
+		while (c < 0 || (r < E.numrows && c >= E.row[r].size)) {
+			r += direction;
+			if (r < 0 || r >= E.numrows) return 0;
+			if (abs(r - row) > max_lines) return 0;
+			c = (direction > 0) ? 0 : E.row[r].size - 1;
+			if (E.row[r].size == 0) {
+				c = (direction > 0) ? 0 : -1;
+				continue;
+			}
+		}
+		if (r < 0 || r >= E.numrows) return 0;
+		if (c < 0 || c >= E.row[r].size) continue;
+
+		/* Skip chars inside strings/comments */
+		unsigned char hl = E.row[r].hl[c];
+		if (hl == HL_STRING || hl == HL_COMMENT || hl == HL_MLCOMMENT)
+			continue;
+
+		char cur = E.row[r].chars[c];
+		if (cur == ch) depth++;
+		else if (cur == target) depth--;
+	}
+
+	*match_row = r;
+	*match_col = c;
+	return 1;
+}
+
 /* --- Undo/Redo --- */
 
 /*
@@ -529,6 +663,26 @@ void editorUndo(void)
 			E.cx = ue.old_cx;
 			E.cy = ue.old_cy;
 			break;
+
+		case UNDO_DELETE_LINE:
+			/* Undo: re-insert the deleted line */
+			editorInsertRow(ue.old_cy, ue.str, ue.str_len);
+			re.str = malloc(ue.str_len);
+			memcpy(re.str, ue.str, ue.str_len);
+			re.str_len = ue.str_len;
+			E.cx = ue.old_cx;
+			E.cy = ue.old_cy;
+			break;
+
+		case UNDO_INSERT_STRING:
+			/* Undo: delete the grouped string */
+			editorRowDeleteChars(&E.row[ue.old_cy], ue.old_cx, ue.str_len);
+			re.str = malloc(ue.str_len);
+			memcpy(re.str, ue.str, ue.str_len);
+			re.str_len = ue.str_len;
+			E.cx = ue.old_cx;
+			E.cy = ue.old_cy;
+			break;
 	}
 
 	free(ue.str);
@@ -620,6 +774,33 @@ void editorRedo(void)
 				E.row[re.old_cy].chars, E.row[re.old_cy].size);
 			E.cy = re.old_cy + 1;
 			E.cx = re.old_cx;
+			break;
+
+		case UNDO_DELETE_LINE:
+			/* Redo: re-delete the line */
+			{
+				erow *row = &E.row[re.old_cy];
+				ue.str = malloc(row->size);
+				memcpy(ue.str, row->chars, row->size);
+				ue.str_len = row->size;
+				editorDeleteRow(re.old_cy);
+				if (E.cy >= E.numrows && E.numrows > 0)
+					E.cy = E.numrows - 1;
+				if (E.numrows > 0 && E.cx > E.row[E.cy].size)
+					E.cx = E.row[E.cy].size;
+			}
+			break;
+
+		case UNDO_INSERT_STRING:
+			/* Redo: re-insert the grouped string */
+			ue.str = malloc(re.str_len);
+			memcpy(ue.str, re.str, re.str_len);
+			ue.str_len = re.str_len;
+			if (re.old_cy == E.numrows)
+				editorInsertRow(E.numrows, "", 0);
+			editorRowInsertString(&E.row[re.old_cy], re.old_cx, re.str, re.str_len);
+			E.cx = re.old_cx + re.str_len;
+			E.cy = re.old_cy;
 			break;
 	}
 

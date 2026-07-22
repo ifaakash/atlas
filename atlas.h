@@ -35,7 +35,8 @@ enum editorHighlight {
 	HL_COMMENT,      /* single-line comments (// ...) */
 	HL_MLCOMMENT,    /* multi-line comments */
 	HL_KEYWORD1,     /* language keywords (if, while, return, etc.) */
-	HL_KEYWORD2      /* type keywords (int, char, void, etc.) */
+	HL_KEYWORD2,     /* type keywords (int, char, void, etc.) */
+	HL_BRACKET_MATCH /* matching bracket highlight */
 };
 
 /*
@@ -88,6 +89,14 @@ struct EditorConfig {
 	char *clipboard;             /* internal clipboard (heap-allocated) */
 	int clipboard_len;           /* length of clipboard content */
 	int line_number_width;       /* width of line number gutter (digits + 1 space) */
+	int bracket_match_row;       /* row of matching bracket, -1 if none */
+	int bracket_match_col;       /* col of matching bracket */
+
+	/* Configuration (loaded from ~/.atlasrc) */
+	int tab_width;
+	int show_line_numbers;
+	int syntax_on;
+	int auto_indent;
 
 	/* Undo/redo stacks — defined below */
 	/* (forward-declared here, actual types defined right after EditorConfig) */
@@ -108,7 +117,9 @@ enum UndoType {
 	UNDO_DELETE_CHAR,     /* backspace deleted a char (cx > 0) */
 	UNDO_JOIN_LINES,      /* backspace at col 0 joined current line to previous */
 	UNDO_INSERT_NEWLINE,  /* Enter split a line or inserted blank line */
-	UNDO_DUPLICATE_LINE   /* Ctrl+D duplicated a line */
+	UNDO_DUPLICATE_LINE,  /* Ctrl+D duplicated a line */
+	UNDO_DELETE_LINE,     /* Ctrl+K deleted an entire line */
+	UNDO_INSERT_STRING    /* grouped character inserts (word-level undo) */
 };
 
 /*
@@ -191,6 +202,8 @@ void editorDeleteRow(int at);
 void editorRowInsertChar(erow *row, int at, int c);
 void editorRowDeleteChar(erow *row, int at);
 void editorRowAppendString(erow *row, char *s, int len);
+void editorRowDeleteChars(erow *row, int at, int count);
+void editorRowInsertString(erow *row, int at, char *s, int len);
 
 /* display.c */
 void abAppend(struct AppendBuffer *ab, const char *s, int len);
@@ -207,6 +220,7 @@ void undoStackInit(UndoStack *s);
 void undoStackPush(UndoStack *s, UndoEntry entry);
 int undoStackPop(UndoStack *s, UndoEntry *out);
 void undoStackClear(UndoStack *s);
+UndoEntry *undoStackPeek(UndoStack *s);
 void editorInsertChar(int c);
 void editorDeleteChar(void);
 void editorInsertNewline(void);
@@ -216,6 +230,8 @@ void editorMoveWordLeft(void);
 void editorMoveWordRight(void);
 void editorDeleteWord(void);
 void editorAutoComplete(void);
+void editorDeleteLine(void);
+int editorFindMatchingBracket(int row, int col, int *match_row, int *match_col);
 void editorUndo(void);
 void editorRedo(void);
 
@@ -241,6 +257,9 @@ void editorClearSelection(void);
 int isSelected(int row, int col);
 void editorCopySelection(void);
 void editorPasteClipboard(void);
+
+/* config.c */
+void editorLoadConfig(void);
 
 /* main.c */
 void initEditor(void);

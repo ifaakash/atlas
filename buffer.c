@@ -90,6 +90,32 @@ void editorRowDeleteChar(erow *row, int at)
 	editorUpdateSyntax(row, row - E.row);
 }
 
+/* Delete 'count' characters starting at position 'at' in a row (bulk delete) */
+void editorRowDeleteChars(erow *row, int at, int count)
+{
+	if (at < 0 || at >= row->size || count <= 0) return;
+	if (at + count > row->size) count = row->size - at;
+
+	memmove(&row->chars[at], &row->chars[at + count], row->size - at - count + 1);
+	row->size -= count;
+	E.dirty++;
+	editorUpdateSyntax(row, row - E.row);
+}
+
+/* Insert string 's' (length 'len') at position 'at' in a row (bulk insert) */
+void editorRowInsertString(erow *row, int at, char *s, int len)
+{
+	if (at < 0 || at > row->size) at = row->size;
+	if (len <= 0) return;
+
+	row->chars = realloc(row->chars, row->size + len + 1);
+	memmove(&row->chars[at + len], &row->chars[at], row->size - at + 1);
+	memcpy(&row->chars[at], s, len);
+	row->size += len;
+	E.dirty++;
+	editorUpdateSyntax(row, row - E.row);
+}
+
 /* Append string 's' (length 'len') to end of a row */
 void editorRowAppendString(erow *row, char *s, int len)
 {

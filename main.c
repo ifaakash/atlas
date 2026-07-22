@@ -26,6 +26,16 @@ void initEditor(void)
 	E.clipboard = NULL;
 	E.clipboard_len = 0;
 	E.line_number_width = 4;  /* default: 3 digits + 1 space */
+	E.bracket_match_row = -1;
+	E.bracket_match_col = -1;
+
+	/* Configuration defaults (overridden by ~/.atlasrc) */
+	E.tab_width = 4;
+	E.show_line_numbers = 1;
+	E.syntax_on = 1;
+	E.auto_indent = 1;
+	editorLoadConfig();
+
 	undoStackInit(&undo_stack);
 	undoStackInit(&redo_stack);
 	getWindowSize(&E.screenrows, &E.screencols);
@@ -94,6 +104,11 @@ void editorProcessKeypress(void)
 		case CTRL_KEY('d'):                 /* Duplicate line */
 			editorClearSelection();
 			editorDuplicateLine();
+			break;
+
+		case CTRL_KEY('k'):                 /* Delete line */
+			editorClearSelection();
+			editorDeleteLine();
 			break;
 
 		case MOUSE_CLICK:                   /* Mouse click — position cursor */
